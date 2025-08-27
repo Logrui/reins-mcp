@@ -1,5 +1,4 @@
-import 'dart:io' show Platform;
-
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -78,9 +77,15 @@ class _ChatTextFieldState extends State<ChatTextField> {
   }
 
   TextInputAction get _textInputAction {
-    return Platform.isIOS || Platform.isAndroid
-        ? TextInputAction.newline
-        : TextInputAction.send;
+    if (kIsWeb) return TextInputAction.send;
+
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.iOS:
+      case TargetPlatform.android:
+        return TextInputAction.newline;
+      default:
+        return TextInputAction.send;
+    }
   }
 
   String _readTextFieldState() {

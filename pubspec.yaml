@@ -34,6 +34,7 @@ dependencies:
   # HTTP package for making network requests
   http: ^1.2.2
   async: ^2.11.0
+  json_rpc_2: ^3.0.2
 
   # State management solution
   provider: ^6.1.2
@@ -78,7 +79,10 @@ dependencies:
   # In-app review
   in_app_review: ^2.0.10
 
-  share_plus: ^10.1.4
+  share_plus: 10.0.0
+
+  # MCP WebSocket client
+  web_socket_channel: 3.0.2
 
 dev_dependencies:
   flutter_test:

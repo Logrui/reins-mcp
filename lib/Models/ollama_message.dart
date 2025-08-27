@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 import 'package:path/path.dart' as path;
 import 'package:reins/Constants/constants.dart';
@@ -136,6 +137,7 @@ class OllamaMessage {
   }
 
   Future<List<String>?> _base64EncodeImages() async {
+    if (kIsWeb) return null;
     if (images != null) {
       return await Future.wait(images!.map(
         (file) async => base64Encode(await file.readAsBytes()),
@@ -146,6 +148,7 @@ class OllamaMessage {
   }
 
   static List<File>? _constructImages(String? raw) {
+    if (kIsWeb) return null;
     if (raw != null) {
       final List<dynamic> decoded = jsonDecode(raw);
       return decoded.map((imageRelativePath) {
@@ -160,6 +163,7 @@ class OllamaMessage {
   }
 
   String? _breakImages(List<File>? images) {
+    if (kIsWeb) return null;
     if (images != null) {
       final relativePathImages = images.map((file) {
         return path.relative(
@@ -178,7 +182,8 @@ class OllamaMessage {
 enum OllamaMessageRole {
   user,
   assistant,
-  system;
+  system,
+  tool;
 
   factory OllamaMessageRole.fromString(String role) {
     switch (role) {
@@ -188,6 +193,8 @@ enum OllamaMessageRole {
         return OllamaMessageRole.assistant;
       case 'system':
         return OllamaMessageRole.system;
+      case 'tool':
+        return OllamaMessageRole.tool;
       default:
         throw ArgumentError('Unknown role: $role');
     }

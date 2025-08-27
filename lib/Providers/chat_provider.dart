@@ -7,13 +7,21 @@ import 'package:reins/Models/ollama_exception.dart';
 import 'package:reins/Models/ollama_message.dart';
 import 'package:reins/Models/ollama_model.dart';
 import 'package:reins/Services/database_service.dart';
+import 'package:reins/Services/mcp_service.dart';
 import 'package:reins/Services/ollama_service.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:reins/Models/mcp.dart';
+import 'package:reins/Utils/tool_call_parser.dart';
+import 'package:reins/Constants/tool_system_prompt.dart';
 
 class ChatProvider extends ChangeNotifier {
   final OllamaService _ollamaService;
   final DatabaseService _databaseService;
+  final McpService _mcpService;
+
+  bool get _dbEnabled => !kIsWeb;
 
   List<OllamaMessage> _messages = [];
   List<OllamaMessage> get messages => _messages;
@@ -28,6 +36,7 @@ class ChatProvider extends ChangeNotifier {
       _currentChatIndex == -1 ? null : _chats[_currentChatIndex];
 
   final Map<String, OllamaMessage?> _activeChatStreams = {};
+  bool _toolFlowActive = false; // guard to prevent re-entrant tool flows
 
   bool get isCurrentChatStreaming =>
       _activeChatStreams.containsKey(currentChat?.id);
@@ -64,17 +73,22 @@ class ChatProvider extends ChangeNotifier {
   ChatProvider({
     required OllamaService ollamaService,
     required DatabaseService databaseService,
+    required McpService mcpService,
   })  : _ollamaService = ollamaService,
-        _databaseService = databaseService {
+        _databaseService = databaseService,
+        _mcpService = mcpService {
     _initialize();
   }
 
   Future<void> _initialize() async {
     _updateOllamaServiceAddress();
 
-    await _databaseService.open("ollama_chat.db");
-    _chats = await _databaseService.getAllChats();
-    notifyListeners();
+    // Disable sqflite-backed database on Web (unsupported)
+    if (!kIsWeb) {
+      await _databaseService.open("ollama_chat.db");
+      _chats = await _databaseService.getAllChats();
+      notifyListeners();
+    }
   }
 
   void destinationChatSelected(int destination) {
@@ -98,7 +112,12 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> _loadCurrentChat() async {
-    _messages = await _databaseService.getMessages(currentChat!.id);
+    if (_dbEnabled) {
+      _messages = await _databaseService.getMessages(currentChat!.id);
+    } else {
+      // On Web, messages are only in-memory for current session
+      _messages = _messages;
+    }
 
     // Add the streaming message to the chat if it exists
     final streamingMessage = _activeChatStreams[currentChat!.id];
@@ -113,7 +132,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> createNewChat(OllamaModel model) async {
-    final chat = await _databaseService.createChat(model.name);
+    final chat = _dbEnabled
+        ? await _databaseService.createChat(model.name)
+        : OllamaChat(model: model.name);
 
     _chats.insert(0, chat);
     _currentChatIndex = 0;
@@ -162,18 +183,32 @@ class ChatProvider extends ChangeNotifier {
         chatOptions: chatOptions ?? OllamaChatOptions(),
       );
     } else {
-      await _databaseService.updateChat(
-        chat,
-        newModel: newModel,
-        newTitle: newTitle,
-        newSystemPrompt: newSystemPrompt,
-        newOptions: newOptions,
-      );
+      if (_dbEnabled) {
+        await _databaseService.updateChat(
+          chat,
+          newModel: newModel,
+          newTitle: newTitle,
+          newSystemPrompt: newSystemPrompt,
+          newOptions: newOptions,
+        );
+      }
 
       final chatIndex = _chats.indexWhere((c) => c.id == chat.id);
 
       if (chatIndex != -1) {
-        _chats[chatIndex] = (await _databaseService.getChat(chat.id))!;
+        if (_dbEnabled) {
+          _chats[chatIndex] = (await _databaseService.getChat(chat.id))!;
+        } else {
+          // On Web, mirror the updates locally
+          final updated = OllamaChat(
+            id: chat.id,
+            model: newModel ?? chat.model,
+            title: newTitle ?? chat.title,
+            systemPrompt: newSystemPrompt ?? chat.systemPrompt,
+            options: newOptions ?? chat.options,
+          );
+          _chats[chatIndex] = updated;
+        }
         notifyListeners();
       } else {
         throw OllamaException("Chat not found.");
@@ -190,7 +225,9 @@ class ChatProvider extends ChangeNotifier {
     _chats.remove(chat);
     _activeChatStreams.remove(chat.id);
 
-    await _databaseService.deleteChat(chat.id);
+    if (!kIsWeb) {
+      await _databaseService.deleteChat(chat.id);
+    }
   }
 
   Future<void> sendPrompt(String text, {List<File>? images}) async {
@@ -208,7 +245,9 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
 
     // Save the user prompt to the database
-    await _databaseService.addMessage(prompt, chat: associatedChat);
+    if (!kIsWeb) {
+      await _databaseService.addMessage(prompt, chat: associatedChat);
+    }
 
     // Initialize the chat stream with the messages in the chat
     await _initializeChatStream(associatedChat);
@@ -253,7 +292,7 @@ class ChatProvider extends ChangeNotifier {
     }
 
     // Save the Ollama message to the database
-    if (ollamaMessage != null) {
+    if (!kIsWeb && ollamaMessage != null) {
       await _databaseService.addMessage(ollamaMessage, chat: associatedChat);
     }
   }
@@ -261,29 +300,29 @@ class ChatProvider extends ChangeNotifier {
   Future<OllamaMessage?> _streamOllamaMessage(OllamaChat associatedChat) async {
     if (_messages.isEmpty) return null;
 
-    final stream = _ollamaService.chatStream(_messages, chat: associatedChat);
+    // Build system prompt with currently known tools from connected servers
+    final allTools = await _mcpService.listTools();
+    final toolSystemPrompt = generateToolSystemPrompt({'connected': allTools});
+
+    final messagesWithSystemPrompt = [
+      OllamaMessage(toolSystemPrompt, role: OllamaMessageRole.system),
+      ..._messages,
+    ];
+
+    final stream = _ollamaService.chatStream(messagesWithSystemPrompt, chat: associatedChat);
 
     OllamaMessage? streamingMessage;
     OllamaMessage? receivedMessage;
 
     await for (receivedMessage in stream) {
-      // If the chat id is not in the active chat streams, it means the stream
-      // is cancelled by the user. So, we need to break the loop.
       if (_activeChatStreams.containsKey(associatedChat.id) == false) {
         streamingMessage?.createdAt = DateTime.now();
         return streamingMessage;
       }
 
       if (streamingMessage == null) {
-        // Keep the first received message to add the content of the following messages
         streamingMessage = receivedMessage;
-
-        // Update the active chat streams key with the ollama message
-        // to be able to show the stream in the chat.
-        // We also use this when the user switches between chats while streaming.
         _activeChatStreams[associatedChat.id] = streamingMessage;
-
-        // Be sure the user is in the same chat while the initial message is received
         if (associatedChat.id == currentChat?.id) {
           _messages.add(streamingMessage);
         }
@@ -292,17 +331,67 @@ class ChatProvider extends ChangeNotifier {
       }
 
       notifyListeners();
+
+      final toolCall = _toolFlowActive ? null : parseToolCall(streamingMessage.content);
+      if (toolCall != null) {
+        _toolFlowActive = true;
+        // Finalize and save the tool call message
+        streamingMessage.createdAt = DateTime.now();
+        if (_dbEnabled) {
+          await _databaseService.addMessage(streamingMessage, chat: associatedChat);
+        }
+
+        // Explicitly cancel current stream for this chat
+        _activeChatStreams.remove(associatedChat.id);
+        notifyListeners();
+
+        try {
+          // Execute the tool call
+          await _executeToolCall(associatedChat, toolCall);
+        } finally {
+          _toolFlowActive = false;
+        }
+        return null; // Stop this stream; a new one will be started.
+      }
     }
 
     if (receivedMessage != null) {
-      // Update the metadata of the streaming message with the last received message
       streamingMessage?.updateMetadataFrom(receivedMessage);
     }
 
-    // Update created at time to the current time when the stream is finished
     streamingMessage?.createdAt = DateTime.now();
 
     return streamingMessage;
+  }
+
+  Future<void> _executeToolCall(OllamaChat associatedChat, McpToolCall toolCall) async {
+    try {
+      final resp = await _mcpService.call(toolCall.server, toolCall.name, toolCall.args);
+      final formatted = formatToolResult(
+        toolCall.name,
+        resp.result,
+        error: resp.error,
+      );
+      final resultMessage = OllamaMessage(formatted, role: OllamaMessageRole.assistant);
+      _messages.add(resultMessage);
+      if (!kIsWeb) {
+        await _databaseService.addMessage(resultMessage, chat: associatedChat);
+      }
+    } catch (e) {
+      final errorMessage = OllamaMessage(
+        formatToolResult(toolCall.name, null, error: e.toString()),
+        role: OllamaMessageRole.assistant,
+      );
+      _messages.add(errorMessage);
+      if (!kIsWeb) {
+        await _databaseService.addMessage(errorMessage, chat: associatedChat);
+      }
+    }
+
+    notifyListeners();
+
+    // Restart the stream with the tool result
+    await _initializeChatStream(associatedChat);
   }
 
   Future<void> regenerateMessage(OllamaMessage message) async {
@@ -319,7 +408,9 @@ class ChatProvider extends ChangeNotifier {
     _messages = stayedMessages;
     notifyListeners();
 
-    await _databaseService.deleteMessages(removeMessages);
+    if (!kIsWeb) {
+      await _databaseService.deleteMessages(removeMessages);
+    }
 
     // Reinitialize the chat stream with the messages in the chat
     await _initializeChatStream(associatedChat);
@@ -332,7 +423,9 @@ class ChatProvider extends ChangeNotifier {
 
     if (_messages.last.role == OllamaMessageRole.assistant) {
       final message = _messages.removeLast();
-      await _databaseService.deleteMessage(message.id);
+      if (!kIsWeb) {
+        await _databaseService.deleteMessage(message.id);
+      }
     }
 
     // Reinitialize the chat stream with the messages in the chat
@@ -348,11 +441,15 @@ class ChatProvider extends ChangeNotifier {
     message.content = newContent ?? message.content;
     notifyListeners();
 
-    await _databaseService.updateMessage(message, newContent: newContent);
+    if (!kIsWeb) {
+      await _databaseService.updateMessage(message, newContent: newContent);
+    }
   }
 
   Future<void> deleteMessage(OllamaMessage message) async {
-    await _databaseService.deleteMessage(message.id);
+    if (_dbEnabled) {
+      await _databaseService.deleteMessage(message.id);
+    }
 
     // If the message is in the chat, remove it from the chat
     if (_messages.remove(message)) {

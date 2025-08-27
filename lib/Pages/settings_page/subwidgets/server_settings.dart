@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 import 'package:hive/hive.dart';
@@ -92,8 +93,8 @@ class _ServerSettingsState extends State<ServerSettings> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             ElevatedButton(
-              onPressed: _isLoading ? null : _handleSearchLocalNetwork,
-              child: const Text('Search Local Network'),
+              onPressed: (kIsWeb || _isLoading) ? null : _handleSearchLocalNetwork,
+              child: Text(kIsWeb ? 'Search Local Network (unavailable on Web)' : 'Search Local Network'),
             ),
             ElevatedButton(
               onPressed: _isLoading ? null : _handleConnectButton,

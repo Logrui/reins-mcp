@@ -1,0 +1,898 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:uuid/uuid.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_channel/io.dart' as io;
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:http/http.dart' as http;
+import 'package:json_rpc_2/json_rpc_2.dart' as rpc;
+
+import 'package:reins/Models/mcp.dart';
+
+enum McpConnectionState { disconnected, connecting, connected, error }
+
+/// Simplified MCP Service supporting only HTTP and WebSocket transports
+/// Compatible with Web, iOS, and Windows Desktop platforms
+class McpService extends ChangeNotifier {
+  final Map<String, MessageChannel> _channels = {};
+  final Map<String, McpConnectionState> _states = {};
+  final Map<String, List<McpTool>> _serverTools = {};
+  final Map<String, Completer<McpResponse>> _pendingRequests = {};
+  final Map<String, String> _requestServerById = {};
+  final Map<String, String> _lastErrors = {};
+  final Map<String, rpc.Peer> _wsPeers = {};
+  final Uuid _uuid = const Uuid();
+  final StreamController<Map<String, McpConnectionState>> _stateController = StreamController.broadcast();
+
+  McpConnectionState getState(String serverUrl) => _states[serverUrl] ?? McpConnectionState.disconnected;
+  bool isConnected(String serverUrl) => getState(serverUrl) == McpConnectionState.connected;
+  String? getLastError(String serverUrl) => _lastErrors[serverUrl];
+  List<McpTool> getTools(String serverUrl) => _serverTools[serverUrl] ?? [];
+  List<McpTool> get allTools => _serverTools.values.expand((tools) => tools).toList();
+
+  void _setState(String serverUrl, McpConnectionState state) {
+    _states[serverUrl] = state;
+    _stateController.add(Map.from(_states));
+    notifyListeners();
+  }
+
+  /// Stream of connection state changes for UI updates
+  Stream<Map<String, McpConnectionState>> connectionStates() => _stateController.stream;
+
+  /// Connect to multiple MCP servers
+  Future<void> connectAll(List<McpServerConfig> servers) async {
+    for (final server in servers) {
+      await connect(server.endpoint, authToken: server.authToken);
+    }
+  }
+
+  /// Connect to MCP server using HTTP or WebSocket transport
+  Future<void> connect(String serverUrl, {String? authToken}) async {
+    if (isConnected(serverUrl)) return;
+
+    _setState(serverUrl, McpConnectionState.connecting);
+    _lastErrors.remove(serverUrl);
+
+    try {
+      final uri = Uri.parse(serverUrl);
+      MessageChannel channel;
+
+      if (uri.scheme == 'ws' || uri.scheme == 'wss') {
+        // WebSocket transport
+        channel = await _connectWebSocket(uri, authToken);
+      } else if (uri.scheme == 'http' || uri.scheme == 'https') {
+        // HTTP transport
+        channel = await _connectHttp(uri, authToken);
+      } else {
+        throw Exception('Unsupported protocol: ${uri.scheme}. Only HTTP and WebSocket are supported.');
+      }
+
+      _channels[serverUrl] = channel;
+
+      // For HTTP channels, manually listen for JSON-RPC messages.
+      // For WebSocket channels, json_rpc_2 Peer will handle messaging.
+      if (channel is! WebSocketMessageChannel) {
+        channel.stream.listen(
+          (message) => _handleMessage(serverUrl, message),
+          onError: (error) {
+            debugPrint('MCP connection error for $serverUrl: $error');
+            _lastErrors[serverUrl] = error.toString();
+            _setState(serverUrl, McpConnectionState.error);
+            disconnect(serverUrl);
+          },
+          onDone: () {
+            debugPrint('MCP connection closed for $serverUrl');
+            disconnect(serverUrl);
+          },
+        );
+      } else {
+        // Create and start a JSON-RPC Peer for WebSocket transport
+        final ws = channel.channel;
+        final peer = rpc.Peer(ws.cast<String>());
+        _wsPeers[serverUrl] = peer;
+        peer.listen();
+      }
+
+      // Initialize MCP connection
+      final initialized = await _initialize(serverUrl);
+      if (!initialized) {
+        _setState(serverUrl, McpConnectionState.error);
+        disconnect(serverUrl);
+        return;
+      }
+
+      _setState(serverUrl, McpConnectionState.connected);
+      await _listToolsForServer(serverUrl);
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Failed to connect to MCP server at $serverUrl: $e');
+      _lastErrors[serverUrl] = e.toString();
+      _setState(serverUrl, McpConnectionState.error);
+      disconnect(serverUrl);
+    }
+  }
+
+  /// Connect via WebSocket
+  Future<MessageChannel> _connectWebSocket(Uri uri, String? authToken) async {
+    final headers = <String, dynamic>{};
+    if (authToken != null && authToken.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $authToken';
+    }
+
+    if (kIsWeb) {
+      debugPrint('MCP WebSocket connect (web) -> $uri');
+      return WebSocketMessageChannel(WebSocketChannel.connect(uri));
+    } else {
+      debugPrint('MCP WebSocket connect -> $uri');
+      final ws = io.IOWebSocketChannel.connect(
+        uri,
+        protocols: ['jsonrpc-2.0'],
+        headers: headers.isEmpty ? null : headers,
+      );
+      return WebSocketMessageChannel(ws);
+    }
+  }
+
+  /// Connect via HTTP
+  Future<MessageChannel> _connectHttp(Uri uri, String? authToken) async {
+    final headers = <String, String>{};
+    if (authToken != null && authToken.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $authToken';
+    }
+
+    debugPrint('MCP HTTP connect -> $uri');
+    final client = http.Client();
+    return HttpMessageChannel(client, uri, headers);
+  }
+
+  void disconnect(String serverUrl) {
+    // Close WS peer if present
+    final peer = _wsPeers.remove(serverUrl);
+    if (peer != null) {
+      try {
+        peer.close();
+      } catch (_) {}
+    }
+    _channels[serverUrl]?.close();
+    _channels.remove(serverUrl);
+    _serverTools.remove(serverUrl);
+    _setState(serverUrl, McpConnectionState.disconnected);
+    
+    // Fail pending requests
+    final idsToFail = _pendingRequests.keys
+        .where((id) => _requestServerById[id] == serverUrl)
+        .toList();
+    for (final id in idsToFail) {
+      final completer = _pendingRequests.remove(id);
+      _requestServerById.remove(id);
+      if (completer != null && !completer.isCompleted) {
+        completer.completeError(Exception('Disconnected from server'));
+      }
+    }
+    notifyListeners();
+  }
+
+  Future<void> disconnectAll() async {
+    final urls = _channels.keys.toList();
+    for (final url in urls) {
+      disconnect(url);
+    }
+  }
+
+  /// Initialize MCP connection
+  Future<bool> _initialize(String serverUrl) async {
+    try {
+      final response = await _rpc(serverUrl, 'initialize', {
+        'protocolVersion': '2024-11-05',
+        'capabilities': {
+          'roots': {'listChanged': true},
+          'sampling': {},
+        },
+        'clientInfo': {
+          'name': 'Reins',
+          'version': '1.0.0',
+        },
+      }).timeout(const Duration(seconds: 20));
+
+      if (response.error != null) {
+        debugPrint('MCP initialize error: ${response.error}');
+        _lastErrors[serverUrl] = 'Initialize failed: ${response.error}';
+        return false;
+      }
+
+      debugPrint('MCP initialized successfully for $serverUrl');
+      return true;
+    } catch (e) {
+      debugPrint('MCP initialize timeout/error for $serverUrl: $e');
+      _lastErrors[serverUrl] = 'Initialize failed: $e';
+      return false;
+    }
+  }
+
+  /// List tools from server
+  Future<void> _listToolsForServer(String serverUrl) async {
+    try {
+      final response = await _rpc(serverUrl, 'tools/list', {})
+          .timeout(const Duration(seconds: 15));
+
+      if (response.error != null) {
+        debugPrint('MCP tools/list error: ${response.error}');
+        _lastErrors[serverUrl] = response.error.toString();
+        return;
+      }
+
+      final result = response.result;
+      final List<McpTool> tools = [];
+
+      if (result is Map && result['tools'] is List) {
+        final toolsList = result['tools'] as List;
+        for (final toolJson in toolsList) {
+          if (toolJson is Map<String, dynamic>) {
+            tools.add(McpTool.fromJson(toolJson));
+          }
+        }
+      }
+
+      _serverTools[serverUrl] = tools;
+      debugPrint('MCP loaded ${tools.length} tools from $serverUrl');
+    } catch (e) {
+      debugPrint('MCP tools/list failed for $serverUrl: $e');
+      _lastErrors[serverUrl] = 'Failed to list tools: $e';
+    }
+  }
+
+  /// Send JSON-RPC request
+  Future<McpResponse> _rpc(String serverUrl, String method, Map<String, dynamic> params) async {
+    final channel = _channels[serverUrl];
+    if (channel == null) {
+      throw Exception('Not connected to server: $serverUrl');
+    }
+
+    // If this server uses WebSocket with a json_rpc_2 Peer, route via Peer.
+    final peer = _wsPeers[serverUrl];
+    if (peer != null) {
+      try {
+        debugPrint('MCP(WS Peer) -> $method');
+        final result = await peer.sendRequest(method, params);
+        return McpResponse(result: result, error: null, id: 'peer');
+      } on rpc.RpcException catch (e) {
+        return McpResponse(
+          result: null,
+          error: McpError(code: e.code, message: e.message, data: e.data),
+          id: 'peer',
+        );
+      } catch (e) {
+        return McpResponse(
+          result: null,
+          error: McpError(code: -32000, message: e.toString(), data: null),
+          id: 'peer',
+        );
+      }
+    }
+
+    final id = _uuid.v4();
+    final request = McpRequest(
+      id: id,
+      method: method,
+      params: params,
+    );
+
+    final completer = Completer<McpResponse>();
+    _pendingRequests[id] = completer;
+    _requestServerById[id] = serverUrl;
+
+    debugPrint('MCP -> $method id=$id');
+    channel.sink.add(request.toJson());
+
+    return completer.future;
+  }
+
+  /// Handle incoming messages
+  void _handleMessage(String serverUrl, dynamic message) {
+    try {
+      final Map<String, dynamic> json;
+      if (message is String) {
+        json = jsonDecode(message);
+      } else if (message is Map<String, dynamic>) {
+        json = message;
+      } else {
+        debugPrint('MCP received unexpected message type: ${message.runtimeType}');
+        return;
+      }
+
+      final id = json['id']?.toString();
+      if (id != null && _pendingRequests.containsKey(id)) {
+        // Response to our request
+        final completer = _pendingRequests.remove(id);
+        _requestServerById.remove(id);
+        
+        if (completer != null && !completer.isCompleted) {
+          final response = McpResponse.fromJson(json);
+          completer.complete(response);
+        }
+      } else {
+        // Notification or other message
+        debugPrint('MCP notification: ${json['method']}');
+      }
+    } catch (e) {
+      debugPrint('Failed to handle MCP message: $e');
+    }
+  }
+
+  /// Call a tool
+  Future<McpToolResult> call(String serverUrl, String toolName, Map<String, dynamic> arguments, {Duration? timeout}) async {
+    try {
+      final response = await _rpc(serverUrl, 'tools/call', {
+        'name': toolName,
+        'arguments': arguments,
+      }).timeout(timeout ?? const Duration(seconds: 30));
+
+      if (response.error != null) {
+        return McpToolResult(
+          result: null,
+          error: response.error.toString(),
+        );
+      }
+
+      return McpToolResult(
+        result: response.result,
+        error: null,
+      );
+    } catch (e) {
+      return McpToolResult(
+        result: null,
+        error: e.toString(),
+      );
+    }
+  }
+
+  /// List all tools from all connected servers
+  Future<List<McpTool>> listTools({String? server}) async {
+    if (server != null) {
+      return getTools(server);
+    }
+    return allTools;
+  }
+}
+
+/// Abstract message channel interface
+abstract class MessageChannel {
+  Stream<dynamic> get stream;
+  MessageSink get sink;
+  Future<void> close();
+}
+
+/// Abstract message sink interface
+abstract class MessageSink {
+  void add(dynamic data);
+  Future<void> close();
+}
+
+/// WebSocket message channel implementation
+class WebSocketMessageChannel implements MessageChannel {
+  final WebSocketChannel _channel;
+
+  WebSocketMessageChannel(this._channel);
+
+  // Expose underlying channel for json_rpc_2 Peer
+  WebSocketChannel get channel => _channel;
+
+  @override
+  Stream<dynamic> get stream => _channel.stream;
+
+  @override
+  MessageSink get sink => WebSocketMessageSink(_channel.sink);
+
+  @override
+  Future<void> close() async {
+    await _channel.sink.close();
+  }
+}
+
+class WebSocketMessageSink implements MessageSink {
+  final WebSocketSink _sink;
+
+  WebSocketMessageSink(this._sink);
+
+  @override
+  void add(dynamic data) {
+    _sink.add(jsonEncode(data));
+  }
+
+  @override
+  Future<void> close() async {
+    await _sink.close();
+  }
+}
+
+/// HTTP/SSE message channel implementation for Docker MCP Gateway
+class HttpMessageChannel implements MessageChannel {
+  final http.Client _client;
+  final Uri _baseUri;
+  final Map<String, String> _headers;
+  final StreamController<dynamic> _controller = StreamController.broadcast();
+  late final HttpMessageSink _sink;
+  StreamSubscription<List<int>>? _sseSubscription;
+  final StringBuffer _buffer = StringBuffer();
+  // Preferred endpoint to POST JSON-RPC to (as emitted by server)
+  Uri? _sessionEndpoint;
+  // Alternative form (canonical fallback)
+  Uri? _sessionEndpointAlt;
+  String? _sessionId;
+  Completer<Uri>? _sessionReady;
+  // Accumulate multi-line SSE event data
+  final StringBuffer _eventDataBuffer = StringBuffer();
+  String _currentEvent = '';
+
+  HttpMessageChannel(this._client, this._baseUri, this._headers) {
+    _sink = HttpMessageSink(_client, _baseUri, _headers, _controller, this);
+    _startSSEConnection();
+  }
+
+  Uri? get sessionEndpoint => _sessionEndpoint;
+  Uri? get sessionEndpointAlt => _sessionEndpointAlt;
+  String? get sessionId => _sessionId;
+
+  Future<Uri?> waitForSession({Duration timeout = const Duration(seconds: 3)}) async {
+    if (_sessionEndpoint != null) return _sessionEndpoint;
+    _sessionReady ??= Completer<Uri>();
+    try {
+      final uri = await _sessionReady!.future.timeout(timeout);
+      return uri;
+    } catch (_) {
+      return _sessionEndpoint; // may still be null
+    }
+  }
+
+  // Parse and set the session endpoint from an SSE payload that may be either:
+  //  - a full/relative path like '/sse?sessionid=abcd' or '/message?sessionId=abcd'
+  //  - a RequestURI string like '?sessionid=abcd' (from gateway's endpoint event)
+  // Prefer the exact endpoint shape provided by the gateway. If it looks like
+  // '/message?sessionId=...' prefer that; also compute canonical fallback '/sse?sessionid=...'.
+  void _setSessionEndpointFromData(String data) {
+    final trimmed = data.trim();
+    if (trimmed.isEmpty) return;
+
+    // Extract session id from any of the following forms:
+    // - ?sessionid=abcd
+    // - ?sessionId=abcd
+    // - /sse?sessionid=abcd
+    // - /message?sessionId=abcd
+    // - full URL variants
+    String? sessionId;
+    try {
+      Uri parsed;
+      if (trimmed.startsWith('?')) {
+        parsed = Uri.parse('http://dummy$trimmed');
+      } else if (trimmed.startsWith('/')) {
+        parsed = Uri.parse('http://dummy$trimmed');
+      } else if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+        parsed = Uri.parse(trimmed);
+      } else {
+        // unknown string; try as query
+        parsed = Uri.parse('http://dummy?$trimmed');
+      }
+      // Case-insensitive fetch: check both keys
+      final q = parsed.queryParameters;
+      sessionId = q['sessionid'] ?? q['sessionId'];
+      // If not found, attempt manual parse
+      sessionId ??= RegExp(r'[?&](sessionid|sessionId)=([^&#\s]+)')
+          .firstMatch(parsed.toString())
+          ?.group(2);
+    } catch (e) {
+      debugPrint('MCP session parse error for "$data": $e');
+    }
+
+    if (sessionId == null || sessionId.isEmpty) {
+      debugPrint('MCP could not extract session id from: $data');
+      return;
+    }
+
+    // Build both forms: preferred (as-gateway) and canonical fallback
+    final canonical = Uri(
+      scheme: _baseUri.scheme,
+      host: _baseUri.host,
+      port: _baseUri.hasPort ? _baseUri.port : null,
+      path: '/sse',
+      queryParameters: {'sessionid': sessionId},
+    );
+
+    Uri preferred;
+    if (trimmed.contains('/message') || trimmed.contains('sessionId=')) {
+      preferred = Uri(
+        scheme: _baseUri.scheme,
+        host: _baseUri.host,
+        port: _baseUri.hasPort ? _baseUri.port : null,
+        path: '/message',
+        queryParameters: {'sessionId': sessionId},
+      );
+    } else {
+      preferred = canonical;
+    }
+
+    _sessionId = sessionId;
+    _sessionEndpoint = preferred;
+    _sessionEndpointAlt = canonical == preferred ? null : canonical;
+    debugPrint('MCP preferred session endpoint: $_sessionEndpoint');
+    if (_sessionEndpointAlt != null) {
+      debugPrint('MCP alt session endpoint: $_sessionEndpointAlt');
+    }
+    if (_sessionReady != null && !(_sessionReady!.isCompleted)) {
+      _sessionReady!.complete(_sessionEndpoint!);
+    }
+  }
+
+  void _startSSEConnection() async {
+    try {
+      // Connect to SSE endpoint for receiving messages
+      final sseUri = _baseUri.resolve('/sse');
+      final sseRequest = http.Request('GET', sseUri);
+      sseRequest.headers.addAll({
+        'Accept': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        ..._headers,
+      });
+
+      debugPrint('MCP HTTP/SSE connecting to: $sseUri');
+      final sseResponse = await _client.send(sseRequest);
+      
+      if (sseResponse.statusCode != 200) {
+        throw Exception('SSE connection failed: ${sseResponse.statusCode}');
+      }
+
+      // Listen to SSE stream
+      _sseSubscription = sseResponse.stream.listen(
+        (chunk) {
+          try {
+            final text = utf8.decode(chunk);
+            _buffer.write(text);
+            
+            final lines = _buffer.toString().split('\n');
+            _buffer.clear();
+            
+            // Keep incomplete line in buffer
+            if (lines.isNotEmpty && !text.endsWith('\n')) {
+              _buffer.write(lines.removeLast());
+            }
+            
+            // Process complete lines
+            for (final line in lines) {
+              final raw = line;
+              final trimmed = raw.trimRight();
+              // Empty line denotes end of one SSE event
+              if (trimmed.isEmpty) {
+                _processSSEEvent();
+                continue;
+              }
+              _processSSELine(trimmed);
+            }
+          } catch (e) {
+            debugPrint('MCP HTTP/SSE decode error: $e');
+          }
+        },
+        onError: (error) {
+          debugPrint('MCP HTTP/SSE stream error: $error');
+          _controller.addError(error);
+        },
+        onDone: () {
+          debugPrint('MCP HTTP/SSE stream closed');
+          _controller.close();
+        },
+      );
+    } catch (e) {
+      debugPrint('MCP HTTP/SSE connection failed: $e');
+    }
+  }
+
+  // Process a single SSE line: track event name, accumulate data lines, and capture non-standard session endpoints
+  void _processSSELine(String line) {
+    if (line.startsWith('event:')) {
+      _currentEvent = line.substring(6).trim();
+      debugPrint('MCP SSE event: $_currentEvent');
+      return;
+    }
+
+    if (line.startsWith('data:')) {
+      final data = line.length >= 5 ? line.substring(5).replaceFirst(RegExp('^ '), '') : '';
+      if (data.isNotEmpty && data != '[DONE]') {
+        if (_eventDataBuffer.isNotEmpty) _eventDataBuffer.write('\n');
+        _eventDataBuffer.write(data);
+      }
+      return;
+    }
+
+    if (line.startsWith('id:')) {
+      return; // ignore metadata for now
+    }
+
+    // Non-standard: session endpoint given as bare line
+    final trimmed = line.trim();
+    if (
+      trimmed.startsWith('/sse?sessionid=') ||
+      trimmed.startsWith('/message?sessionId=') ||
+      trimmed.contains('sessionid=') ||
+      trimmed.contains('sessionId=')
+    ) {
+      _setSessionEndpointFromData(trimmed);
+      return;
+    }
+
+    // Unknown non-empty line
+    if (trimmed.isNotEmpty) {
+      debugPrint('MCP HTTP/SSE unknown line: $line');
+    }
+  }
+
+  // When a blank line ends an SSE event, parse accumulated data as one message, using current event name
+  void _processSSEEvent() {
+    if (_eventDataBuffer.isEmpty) return;
+    final blob = _eventDataBuffer.toString();
+    _eventDataBuffer.clear();
+    final eventName = _currentEvent;
+    _currentEvent = '';
+
+    final data = blob.trim();
+    if (data.isEmpty || data == '[DONE]') return;
+
+    if (eventName == 'endpoint') {
+      // endpoint handshake: normalize session endpoint
+      debugPrint('MCP SSE endpoint data: $data');
+      _setSessionEndpointFromData(data);
+      return;
+    }
+
+    if (data.startsWith('{') || data.startsWith('[')) {
+      try {
+        debugPrint('MCP SSE message payload (first 200): ${data.substring(0, data.length > 200 ? 200 : data.length)}');
+        final decoded = jsonDecode(data);
+
+        void forward(dynamic obj) {
+          try {
+            if (obj is Map && obj.containsKey('id')) {
+              debugPrint('MCP SSE forward response id=${obj['id']}');
+            } else if (obj is Map && obj.containsKey('method')) {
+              debugPrint('MCP SSE forward notification method=${obj['method']}');
+            } else {
+              debugPrint('MCP SSE forward untyped object');
+            }
+            _controller.add(obj);
+          } catch (e) {
+            debugPrint('MCP HTTP/SSE forward error: $e');
+          }
+        }
+
+        dynamic tryUnwrap(dynamic obj) {
+          if (obj is Map<String, dynamic> && obj.containsKey('jsonrpc')) return obj;
+
+          if (obj is Map<String, dynamic>) {
+            if (obj.containsKey('data')) {
+              final inner = obj['data'];
+              final unwrapped = tryUnwrap(inner);
+              if (unwrapped != null) return unwrapped;
+            }
+            if (obj.containsKey('message')) {
+              final inner = obj['message'];
+              final unwrapped = tryUnwrap(inner);
+              if (unwrapped != null) return unwrapped;
+            }
+            if (obj.containsKey('payload')) {
+              final inner = obj['payload'];
+              final unwrapped = tryUnwrap(inner);
+              if (unwrapped != null) return unwrapped;
+            }
+          }
+
+          if (obj is String) {
+            final s = obj.trim();
+            if (s.isNotEmpty && (s.startsWith('{') || s.startsWith('['))) {
+              try {
+                final innerDecoded = jsonDecode(s);
+                return tryUnwrap(innerDecoded) ?? innerDecoded;
+              } catch (_) {
+                return null;
+              }
+            }
+          }
+
+          if (obj is List) {
+            return obj;
+          }
+
+          return null;
+        }
+
+        final unwrapped = tryUnwrap(decoded);
+        if (unwrapped is List) {
+          for (final item in unwrapped) {
+            final single = tryUnwrap(item) ?? item;
+            forward(single);
+          }
+        } else if (unwrapped != null) {
+          forward(unwrapped);
+        } else {
+          forward(decoded);
+        }
+      } catch (e) {
+        debugPrint('MCP HTTP/SSE JSON parse error: $e');
+      }
+    } else {
+      // Non-JSON payload may carry session endpoint
+      debugPrint('MCP HTTP/SSE received non-JSON data (event=$eventName): $data');
+      if (
+        data.startsWith('?sessionid=') ||
+        data.startsWith('?sessionId=') ||
+        data.startsWith('/sse?sessionid=') ||
+        data.startsWith('/message?sessionId=') ||
+        data.contains('sessionid=') ||
+        data.contains('sessionId=')
+      ) {
+        _setSessionEndpointFromData(data);
+      }
+    }
+  }
+
+  @override
+  Stream<dynamic> get stream => _controller.stream;
+
+  @override
+  MessageSink get sink => _sink;
+
+  @override
+  Future<void> close() async {
+    await _sseSubscription?.cancel();
+    await _controller.close();
+    _client.close();
+  }
+}
+
+class HttpMessageSink implements MessageSink {
+  final http.Client _client;
+  final Uri _baseUri;
+  final Map<String, String> _headers;
+  final StreamController<dynamic> _controller;
+  final HttpMessageChannel _channel;
+
+  HttpMessageSink(this._client, this._baseUri, this._headers, this._controller, this._channel);
+
+  @override
+  void add(dynamic data) {
+    _sendMessage(data);
+  }
+
+  void _sendMessage(dynamic data) async {
+    try {
+      // If data is already a JSON string (e.g., McpRequest.toJson()), don't re-encode.
+      final String message = data is String ? data : jsonEncode(data);
+      debugPrint('MCP HTTP sending message: $message');
+      
+      // Build endpoint list with session endpoint first if available
+      final endpoints = <Uri>[];
+      // Wait briefly for session endpoint if not yet available
+      final session = await _channel.waitForSession(timeout: const Duration(seconds: 3));
+      if (session != null) {
+        if (!endpoints.contains(session)) endpoints.add(session);
+      } else if (_channel.sessionEndpoint != null) {
+        if (!endpoints.contains(_channel.sessionEndpoint!)) endpoints.add(_channel.sessionEndpoint!);
+      }
+      // Add alternate canonical endpoint if available
+      if (_channel.sessionEndpointAlt != null) {
+        final alt = _channel.sessionEndpointAlt!;
+        if (!endpoints.contains(alt)) endpoints.add(alt);
+      }
+      endpoints.addAll([
+        _baseUri.resolve('/message'),  // Common MCP gateway endpoint
+        _baseUri.resolve('/rpc'),      // Alternative RPC endpoint
+        _baseUri,                      // Base endpoint
+      ]);
+
+      http.Response? response;
+      
+      for (final endpoint in endpoints) {
+        try {
+          debugPrint('MCP HTTP trying POST to: $endpoint');
+          response = await _postWithRedirects(endpoint, message);
+
+          // Success - break out of loop
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            debugPrint('MCP HTTP POST success to: $endpoint');
+            break;
+          } else if (response.statusCode == 400) {
+            // Bad Request - log the response body for debugging
+            debugPrint('MCP HTTP POST 400 Bad Request to $endpoint: ${response.reasonPhrase}');
+            debugPrint('Response body: ${response.body}');
+          } else if (response.statusCode != 404 && response.statusCode != 405) {
+            // Not a "not found" or "method not allowed" - might be other error worth reporting
+            debugPrint('MCP HTTP POST failed to $endpoint: ${response.statusCode} ${response.reasonPhrase}');
+            if (response.body.isNotEmpty) {
+              debugPrint('Response body: ${response.body}');
+            }
+          }
+        } catch (e) {
+          debugPrint('MCP HTTP POST error to $endpoint: $e');
+          continue;
+        }
+      }
+
+      if (response != null && response.statusCode >= 200 && response.statusCode < 300) {
+        // Success - process response if there's content
+        if (response.body.isNotEmpty) {
+          try {
+            final responseJson = jsonDecode(response.body);
+            // Don't add to stream - SSE handles incoming messages
+            debugPrint('MCP HTTP POST response: $responseJson');
+          } catch (e) {
+            debugPrint('MCP HTTP response parse error: $e');
+          }
+        }
+      } else {
+        debugPrint('MCP HTTP send failed to all endpoints');
+      }
+    } catch (e) {
+      debugPrint('MCP HTTP send error: $e');
+    }
+  }
+
+  Future<http.Response> _postWithRedirects(Uri uri, String body, {int maxRedirects = 5}) async {
+    var currentUri = uri;
+    var redirectCount = 0;
+
+    while (redirectCount < maxRedirects) {
+      debugPrint('MCP HTTP POST attempt ${redirectCount + 1} to: $currentUri');
+      
+      final response = await _client.post(
+        currentUri,
+        headers: {
+          'Content-Type': 'application/json',
+          ..._headers,
+        },
+        body: body,
+      );
+
+      debugPrint('MCP HTTP response: ${response.statusCode} ${response.reasonPhrase}');
+
+      if (response.statusCode == 307 || response.statusCode == 302 || response.statusCode == 301) {
+        final location = response.headers['location'];
+        debugPrint('MCP HTTP redirect location header: $location');
+        
+        if (location != null && location.isNotEmpty) {
+          Uri nextUri;
+          
+          if (location.startsWith('http://') || location.startsWith('https://')) {
+            // Absolute URL
+            nextUri = Uri.parse(location);
+          } else if (location.startsWith('/')) {
+            // Absolute path - use same scheme and host
+            nextUri = Uri(
+              scheme: currentUri.scheme,
+              host: currentUri.host,
+              port: currentUri.port,
+              path: location,
+            );
+          } else {
+            // Relative path
+            nextUri = currentUri.resolve(location);
+          }
+          
+          debugPrint('MCP HTTP redirect ${redirectCount + 1}: $currentUri -> $nextUri');
+          currentUri = nextUri;
+          redirectCount++;
+          continue;
+        } else {
+          debugPrint('MCP HTTP redirect without location header');
+          return response;
+        }
+      }
+
+      return response;
+    }
+
+    throw Exception('Too many redirects (max: $maxRedirects)');
+  }
+
+  @override
+  Future<void> close() async {
+    // HTTP client will be closed by the channel
+  }
+}

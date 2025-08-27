@@ -6,19 +6,27 @@ import 'package:reins/Pages/main_page.dart';
 import 'package:reins/Pages/settings_page/settings_page.dart';
 import 'package:reins/Providers/chat_provider.dart';
 import 'package:reins/Services/database_service.dart';
+import 'package:reins/Services/mcp_service.dart';
 import 'package:reins/Services/ollama_service.dart';
+import 'package:reins/Models/mcp.dart';
 import 'package:reins/Utils/material_color_adapter.dart';
 import 'package:provider/provider.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:reins/Utils/request_review_helper.dart';
 import 'package:responsive_framework/responsive_framework.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io' show Platform;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  if (Platform.isWindows || Platform.isLinux) {
+  // Global guards: log errors instead of crashing the app window on startup
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.dumpErrorToConsole(details);
+  };
+
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   }
@@ -33,7 +41,9 @@ void main() async {
   await Hive.openBox('settings');
 
   // Initialize singleton instances
-  await PathManager.initialize();
+  if (!kIsWeb) {
+    await PathManager.initialize();
+  }
   final reviewHelper = await RequestReviewHelper.initialize();
 
   // Increment the launch count
@@ -45,21 +55,45 @@ void main() async {
     await inAppReview.requestReview();
   }
 
+  // Prepare MCP service (defer connections until after first frame)
+  final mcpService = McpService();
+
   runApp(
     MultiProvider(
       providers: [
         Provider(create: (_) => OllamaService()),
         Provider(create: (_) => DatabaseService()),
+        ChangeNotifierProvider.value(value: mcpService),
         ChangeNotifierProvider(
           create: (context) => ChatProvider(
             ollamaService: context.read(),
             databaseService: context.read(),
+            mcpService: context.read(),
           ),
         ),
       ],
       child: const ReinsApp(),
     ),
   );
+
+  // Defer MCP connect so the window paints even if MCP is misconfigured
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    try {
+      final settings = Hive.box('settings');
+      final List<dynamic> rawServers = settings.get('mcpServers', defaultValue: <dynamic>[]);
+      final mcpConfigs = rawServers
+          .whereType<Map>()
+          .map((m) => McpServerConfig.fromJson(m.cast<String, dynamic>()))
+          .toList();
+      if (mcpConfigs.isNotEmpty) {
+        await mcpService.connectAll(mcpConfigs);
+        await mcpService.listTools();
+      }
+    } catch (e, st) {
+      // Swallow errors to avoid taking down the UI; logs visible in console
+      debugPrint('Deferred MCP connect failed: $e\n$st');
+    }
+  });
 }
 
 class ReinsApp extends StatelessWidget {

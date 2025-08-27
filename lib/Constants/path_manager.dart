@@ -1,5 +1,5 @@
 import 'dart:io';
-
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:path_provider/path_provider.dart';
 
 class PathManager {
@@ -9,6 +9,11 @@ class PathManager {
   PathManager._internal();
 
   static Future<void> initialize() async {
+    if (kIsWeb) {
+      // No documents directory on Web; skip initialization
+      return;
+    }
+
     final directory = await getApplicationDocumentsDirectory();
     _instance.documentsDirectory = directory;
   }

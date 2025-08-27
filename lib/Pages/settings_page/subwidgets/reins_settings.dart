@@ -1,14 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:in_app_review/in_app_review.dart';
-import 'dart:io' show Platform;
 
 class ReinsSettings extends StatelessWidget {
   const ReinsSettings({super.key});
 
   @override
   Widget build(BuildContext context) {
+    final bool isMobile = !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.iOS ||
+            defaultTargetPlatform == TargetPlatform.android);
+    final bool isDesktop = !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.linux ||
+            defaultTargetPlatform == TargetPlatform.windows);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -23,7 +31,9 @@ class ReinsSettings extends StatelessWidget {
           title: Text('Review Reins'),
           subtitle: Text('Share your feedback'),
           onTap: () async {
-            if (await InAppReview.instance.isAvailable() && Platform.isIOS) {
+            if (isMobile &&
+                defaultTargetPlatform == TargetPlatform.iOS &&
+                await InAppReview.instance.isAvailable()) {
               InAppReview.instance.openStoreListing(appStoreId: "6739738501");
             } else {
               launchUrlString('https://github.com/ibrahimcetin/reins');
@@ -40,7 +50,7 @@ class ReinsSettings extends StatelessWidget {
             );
           },
         ),
-        if (Platform.isAndroid || Platform.isIOS)
+        if (isMobile)
           ListTile(
             leading: Icon(Icons.desktop_mac_outlined),
             title: Text('Try Desktop App'),
@@ -49,7 +59,7 @@ class ReinsSettings extends StatelessWidget {
               launchUrlString('https://github.com/ibrahimcetin/reins/releases');
             },
           ),
-        if (Platform.isMacOS || Platform.isLinux || Platform.isWindows)
+        if (isDesktop)
           ListTile(
             leading: Icon(Icons.phone_iphone_outlined),
             title: Text('Try Mobile App'),

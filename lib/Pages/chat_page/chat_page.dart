@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:image_picker/image_picker.dart';
@@ -268,6 +269,16 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _handleAttachmentButton() async {
+    if (kIsWeb) {
+      // Attachments are not yet supported on Web due to lack of file system access
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Image attachments are not available on Web yet.')),
+        );
+      }
+      return;
+    }
+
     if (Platform.isIOS) {
       final photosPermission = await Permission.photos
           .onDeniedCallback(_showPhotosDeniedAlert)
@@ -283,7 +294,7 @@ class _ChatPageState extends State<ChatPage> {
 
     if (pickedImages.isEmpty) return;
 
-    // Create images directory if it doesn't exist
+    // Create images directory if it doesn't exist (non-Web only)
     final documentsDirectory = await getApplicationDocumentsDirectory();
     final imagesPath = path.join(documentsDirectory.path, 'images');
     await Directory(imagesPath).create(recursive: true);

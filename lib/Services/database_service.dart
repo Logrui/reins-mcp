@@ -14,7 +14,7 @@ class DatabaseService {
   Future<void> open(String databaseFile) async {
     _db = await openDatabase(
       path.join(await getDatabasesPath(), databaseFile),
-      version: 1,
+      version: 2,
       onCreate: (Database db, int version) async {
         await db.execute('''CREATE TABLE IF NOT EXISTS chats (
 chat_id TEXT PRIMARY KEY,
@@ -29,7 +29,7 @@ message_id TEXT PRIMARY KEY,
 chat_id TEXT NOT NULL,
 content TEXT NOT NULL,
 images TEXT,
-role TEXT CHECK(role IN ('user', 'assistant', 'system')) NOT NULL,
+role TEXT CHECK(role IN ('user', 'assistant', 'system', 'tool')) NOT NULL,
 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
 FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
 ) WITHOUT ROWID;''');
@@ -47,6 +47,38 @@ WHEN OLD.images IS NOT NULL
 BEGIN
   INSERT INTO cleanup_jobs (image_paths) VALUES (OLD.images);
 END;''');
+      },
+      onUpgrade: (Database db, int oldVersion, int newVersion) async {
+        if (oldVersion < 2) {
+          // In version 2, we add the 'tool' role to the messages table.
+          // SQLite doesn't support modifying CHECK constraints directly, so we have to
+          // recreate the table.
+          await db.execute('ALTER TABLE messages RENAME TO messages_old;');
+
+          await db.execute('''CREATE TABLE messages (
+            message_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            images TEXT,
+            role TEXT CHECK(role IN ('user', 'assistant', 'system', 'tool')) NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+          ) WITHOUT ROWID;''');
+
+          await db.execute(
+            'INSERT INTO messages(message_id, chat_id, content, images, role, timestamp) SELECT message_id, chat_id, content, images, role, timestamp FROM messages_old;'
+          );
+
+          await db.execute('DROP TABLE messages_old;');
+
+          // The trigger was dropped when the table was dropped, so we need to recreate it.
+          await db.execute('''CREATE TRIGGER IF NOT EXISTS delete_images_trigger
+          AFTER DELETE ON messages
+          WHEN OLD.images IS NOT NULL
+          BEGIN
+            INSERT INTO cleanup_jobs (image_paths) VALUES (OLD.images);
+          END;''');
+        }
       },
     );
   }
