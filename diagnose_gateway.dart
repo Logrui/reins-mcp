@@ -1,14 +1,15 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:http/http.dart' as http;
 
 Future<void> main() async {
-  print('=== Docker MCP Gateway Diagnostics ===\n');
+  debugPrint('=== Docker MCP Gateway Diagnostics ===\n');
   
   final baseUrl = 'http://localhost:7999';
   final client = http.Client();
   
   // Test if the gateway is running at all
-  print('1. Testing basic connectivity...');
+  debugPrint('1. Testing basic connectivity...');
   final basicEndpoints = [
     '$baseUrl/',
     '$baseUrl/health',
@@ -20,29 +21,29 @@ Future<void> main() async {
   for (final endpoint in basicEndpoints) {
     try {
       final response = await client.get(Uri.parse(endpoint)).timeout(Duration(seconds: 3));
-      print('   $endpoint -> ${response.statusCode}');
+      debugPrint('   $endpoint -> ${response.statusCode}');
       if (response.statusCode < 500) {
         gatewayRunning = true;
         if (response.body.isNotEmpty && response.body.length < 500) {
-          print('     Body: ${response.body}');
+          debugPrint('     Body: ${response.body}');
         }
       }
     } catch (e) {
-      print('   $endpoint -> Failed: $e');
+      debugPrint('   $endpoint -> Failed: $e');
     }
   }
   
   if (!gatewayRunning) {
-    print('\n❌ Gateway appears to be down or not accessible at localhost:7999');
-    print('   Please check:');
-    print('   - Is the Docker container running?');
-    print('   - Is it bound to port 7999?');
-    print('   - Are there any firewall issues?');
+    debugPrint('\n❌ Gateway appears to be down or not accessible at localhost:7999');
+    debugPrint('   Please check:');
+    debugPrint('   - Is the Docker container running?');
+    debugPrint('   - Is it bound to port 7999?');
+    debugPrint('   - Are there any firewall issues?');
     client.close();
     return;
   }
   
-  print('\n2. Testing SSE endpoint patterns...');
+  debugPrint('\n2. Testing SSE endpoint patterns...');
   final sseEndpoints = [
     '$baseUrl/sse',
     '$baseUrl/events',
@@ -61,28 +62,28 @@ Future<void> main() async {
       });
       
       final streamedResponse = await client.send(request).timeout(Duration(seconds: 3));
-      print('   $endpoint -> ${streamedResponse.statusCode}');
+      debugPrint('   $endpoint -> ${streamedResponse.statusCode}');
       
       if (streamedResponse.statusCode == 200) {
-        print('     ✅ SSE endpoint found!');
+        debugPrint('     ✅ SSE endpoint found!');
         // Try to read a few bytes to see if it's actually streaming
         try {
           final stream = streamedResponse.stream.timeout(Duration(seconds: 2));
           await for (final chunk in stream.take(1)) {
             final text = String.fromCharCodes(chunk);
-            print('     First chunk: ${text.substring(0, text.length > 100 ? 100 : text.length)}...');
+            debugPrint('     First chunk: ${text.substring(0, text.length > 100 ? 100 : text.length)}...');
             break;
           }
         } catch (e) {
-          print('     Stream test failed: $e');
+          debugPrint('     Stream test failed: $e');
         }
       }
     } catch (e) {
-      print('   $endpoint -> Failed: $e');
+      debugPrint('   $endpoint -> Failed: $e');
     }
   }
   
-  print('\n3. Testing JSON-RPC endpoint patterns...');
+  debugPrint('\n3. Testing JSON-RPC endpoint patterns...');
   final rpcEndpoints = [
     baseUrl,
     '$baseUrl/rpc',
@@ -115,32 +116,32 @@ Future<void> main() async {
         body: jsonEncode(testPayload),
       ).timeout(Duration(seconds: 5));
       
-      print('   $endpoint -> ${response.statusCode}');
+      debugPrint('   $endpoint -> ${response.statusCode}');
       if (response.statusCode != 404 && response.body.isNotEmpty) {
-        print('     Body: ${response.body}');
+        debugPrint('     Body: ${response.body}');
         
         // Try to parse as JSON-RPC response
         try {
           final jsonResponse = jsonDecode(response.body);
           if (jsonResponse is Map && jsonResponse.containsKey('jsonrpc')) {
-            print('     ✅ Valid JSON-RPC response!');
+            debugPrint('     ✅ Valid JSON-RPC response!');
             if (jsonResponse.containsKey('result')) {
-              print('     Result: ${jsonResponse['result']}');
+              debugPrint('     Result: ${jsonResponse['result']}');
             }
             if (jsonResponse.containsKey('error')) {
-              print('     Error: ${jsonResponse['error']}');
+              debugPrint('     Error: ${jsonResponse['error']}');
             }
           }
         } catch (e) {
-          print('     Not valid JSON-RPC: $e');
+          debugPrint('     Not valid JSON-RPC: $e');
         }
       }
     } catch (e) {
-      print('   $endpoint -> Failed: $e');
+      debugPrint('   $endpoint -> Failed: $e');
     }
   }
   
-  print('\n4. Testing alternative HTTP methods...');
+  debugPrint('\n4. Testing alternative HTTP methods...');
   final methods = ['PUT', 'PATCH'];
   for (final method in methods) {
     try {
@@ -149,19 +150,19 @@ Future<void> main() async {
       request.body = jsonEncode(testPayload);
       
       final response = await client.send(request).timeout(Duration(seconds: 3));
-      print('   $method $baseUrl -> ${response.statusCode}');
+      debugPrint('   $method $baseUrl -> ${response.statusCode}');
     } catch (e) {
-      print('   $method $baseUrl -> Failed: $e');
+      debugPrint('   $method $baseUrl -> Failed: $e');
     }
   }
   
-  print('\n=== Diagnostic Complete ===');
-  print('If no working endpoints were found, please check your Docker MCP gateway configuration.');
-  print('Common issues:');
-  print('- Gateway not running or crashed');
-  print('- Port binding issues (check docker ps)');
-  print('- Different port or host configuration');
-  print('- Authentication required');
+  debugPrint('\n=== Diagnostic Complete ===');
+  debugPrint('If no working endpoints were found, please check your Docker MCP gateway configuration.');
+  debugPrint('Common issues:');
+  debugPrint('- Gateway not running or crashed');
+  debugPrint('- Port binding issues (check docker ps)');
+  debugPrint('- Different port or host configuration');
+  debugPrint('- Authentication required');
   
   client.close();
 }

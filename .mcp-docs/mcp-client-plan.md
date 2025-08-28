@@ -323,19 +323,13 @@ String formatToolResult(String toolName, dynamic result, {String? error});
   - [x] Logging: add clear logs for extracted session endpoint and forwarded JSON-RPC objects.
   - [x] Gateway alignment: handle lowercase `sessionid` and resolve endpoint event RequestURI `?sessionid=...` to `/sse?sessionid=...`.
 
-### Progress Update — 2025-08-27 (json_rpc_2 integration plan)
-
-- [x] Dependency: added `json_rpc_2: ^3.0.2` to `pubspec.yaml`.
-- [x] WebSocket path (Phase A): wrap WS channel with `json_rpc_2.Peer` (or `Client`) to manage ids, requests, notifications, and errors.
-  - Use `web_socket_channel` to obtain a `StreamChannel<String>`; pass to Peer.
-  - Route `initialize`, `tools/list`, and `tools/call` via `peer.sendRequest()`.
   - Listen for `notification` (e.g., `initialized`).
-- [ ] HTTP/SSE path (Phase B): build a custom `StreamChannel<String>`:
+- [x] HTTP/SSE path (Phase B): build a custom `StreamChannel<String>`:
   - Stream: SSE incoming JSON lines/messages.
   - Sink: HTTP POST to the discovered session endpoint (`/message` or `/sse?sessionid=...`).
   - Wrap this channel with `json_rpc_2.Peer` for uniform handling.
-- [ ] Reconnect/backoff: adopt `retry` for WS reconnects and SSE re-subscribe with exponential backoff.
-- [ ] Heartbeat: send `$/ping` (custom) or a benign request periodically; drop/reconnect on timeout.
+ - [x] Reconnect/backoff: implemented WS exponential backoff reconnect in `lib/Services/mcp_service.dart` and SSE auto re-subscribe with exponential backoff in `lib/Services/http_sse_channel.dart`.
+ - [x] Heartbeat: implemented periodic `$/ping` via `json_rpc_2.Peer` for WS in `McpService`; on timeout/error triggers reconnect.
 
 Immediate next actions
 - [x] Refactor `lib/Services/mcp_service.dart` WS transport to construct `Peer` and route `_rpc()` through it. (done)
@@ -344,7 +338,7 @@ Immediate next actions
 - [ ] Then swap HTTP/SSE to `Peer` once the custom channel is in place.
 
 Immediate next steps
-- [ ] Implement `StreamChannel<String>` wrapper for HTTP/SSE and wrap with `json_rpc_2.Peer` to unify transports.
+- [x] Implement `StreamChannel<String>` wrapper for HTTP/SSE and wrap with `json_rpc_2.Peer` to unify transports.
 - [ ] Add reconnect/backoff and optional heartbeat for SSE + POST.
 - [ ] Reduce verbose logging in release builds; keep debug switches.
 - [ ] Add tests for SSE parsing and endpoint handling.
@@ -358,15 +352,42 @@ Immediate next steps
 
 ### What worked — Gateway SSE integration
 
-- __Endpoint preference__: The gateway emits `endpoint` data like `/message?sessionId=<id>`. We now prefer posting to that exact endpoint, with a fallback to the canonical `{base}/sse?sessionid=<id>`.
-- __JSON body handling__: `HttpMessageSink._sendMessage()` avoids double-encoding. If the request is already a JSON string (e.g., `McpRequest.toJson()`), we send it as-is; otherwise we `jsonEncode` the object. This resolved gateway `-32700 Failed to parse message`.
-- __Verified flow__: Initialize succeeded and `tools/list` returned 44 tools. Logs: `MCP HTTP POST success to: .../message?sessionId=...` then SSE `message` with matching `id`.
+- __LLM adherence to protocol__: It might not always emit perfect `TOOL_CALL:` JSON.
+  - Mitigate with clear prompt instructions and strict examples.
+  - Parser tolerates whitespace and buffers incomplete lines.
+- __Transport variability__: Some MCP servers require stdio.
+  - Start with WebSocket; add stdio in Production phases.
+- __Latency__: Tool calls can increase round-trip time.
+  - Show spinner; consider timeouts; allow cancel.
+ - __Web constraints__: HTTPS + WSS required; no stdio; no port scanning. Document dev reverse-proxy with valid certs.
+ - __Large tool outputs__: Truncate or summarize `TOOL_RESULT:` to avoid blowing model context; provide expandable UI later.
+ - __Stream orchestration__: Risk of duplicate/interleaved tokens. Use explicit cancellation and state machine in `ChatProvider`; add tests.
 
-### Next steps
 
-- __Unify transports with json_rpc_2__: Implement a `StreamChannel<String>` wrapper for HTTP/SSE and back it with `json_rpc_2.Peer`, like the WebSocket path, to centralize RPC logic and retries.
-- __Resilience__: Add reconnect/backoff for SSE and POST, and optional heartbeat.
-- __Logging hygiene__: Reduce verbose logs for release profiles.
+## MVP Implementation Stages and Actionable Steps
+
+### Progress Update — 2025-08-28
+
+- [x] Implemented `HttpSseStreamChannel` at `lib/Services/http_sse_channel.dart` bridging SSE (incoming) and POST (outgoing) under `StreamChannel<String>`.
+- [x] Wired HTTP/SSE transport through `json_rpc_2.Peer` in `lib/Services/mcp_service.dart` (`_connectHttp` now constructs `Peer` over `HttpSseStreamChannel`).
+- [x] Removed legacy manual HTTP routing and unused `_handleMessage()` now that both transports use Peer.
+- [x] Added dependency `stream_channel: ^2.1.2` and fetched deps.
+- [x] Resilience: WS heartbeat + reconnect with exponential backoff; SSE re-subscribe with backoff and lifecycle cleanup.
+- [x] Refactor: moved top-level heartbeat/reconnect helpers into `McpService` as private instance methods (`_startHeartbeat`, `_heartbeat`, `_scheduleWsReconnect`) to fix scope error (`_heartbeatTimers` undefined) and to access class state consistently.
+- [x] Analyzer cleanup: removed unused `_controller` parameter/field from `HttpMessageSink` and updated its construction in `HttpMessageChannel` to eliminate warnings.
+- [x] Analyzer cleanup: consolidated duplicate `flutter/foundation.dart` imports into a single selective import in `lib/Services/mcp_service_backup.dart` and `lib/Services/mcp_service_simplified.dart`.
+- [x] Analyzer cleanup: converted `print` to `debugPrint` in `diagnose_gateway.dart`.
+- [x] Analyzer cleanup: removed unnecessary cast in `_handleMessage()` in `lib/Services/mcp_service_backup.dart`.
+- [x] Docs: fixed dartdoc comments in `lib/Services/http_sse_channel.dart` to wrap generics/endpoints in code spans and avoid HTML rendering.
+- [ ] Widgets: started removing unused `super.key` from private widget constructors (`_ReinsLargeMainPage`, `_ChatConfigureBottomSheetContent`, `_RenameButton`, `_SaveAsNewModelButton`, `_DeleteButton`, `_BottomSheetTextField`). Continue scanning remaining widgets.
+- [ ] Logging hygiene (pending): gate verbose logs and scrub sensitive values.
+
+### Analyzer cleanup (round 2)
+
+- [x] Widgets: removed unused `super.key` from private constructors in `lib/Pages/settings_page/subwidgets/server_settings.dart` (`_ConnectionStatusIndicator`, `_OllamaInfoBottomSheet`).
+- [x] Colors: replaced deprecated `Color.value` with `toARGB32()` in `lib/Utils/material_color_adapter.dart` (read/write and predicate).
+- [x] Tests: added dev dependencies `path_provider_platform_interface` and `plugin_platform_interface` in `pubspec.yaml` to satisfy test imports.
+- [~] Temporary: added `// ignore: deprecated_member_use` around `RadioListTile.groupValue/onChanged` in `lib/Widgets/selection_bottom_sheet.dart`. TODO: migrate to `RadioGroup` API when adopting Flutter 3.32+ patterns.
 
 ## Cross-Platform Transport Support Plan
 
@@ -508,17 +529,44 @@ Deliverables will include code changes, platform-specific setup docs, and loggin
 
 ### Stage 5 — Tests
 
-- __Create__ `test/tool_call_parser_test.dart`
-  - Cases: valid call, extra whitespace, invalid JSON, partial lines.
+## Implementation-First Next Steps (skip tests for now)
 
-- __Create__ `test/mcp_service_test.dart`
-  - Mock WebSocket server; cover `initialize`, `tools/list`, `tools/call`, error mapping.
+- [ ] __Unify HTTP/SSE with json_rpc_2 via Peer__
+  - [ ] Create `lib/Services/http_sse_channel.dart`
+    - Defines `HttpSseStreamChannel` that implements `StreamChannel<String>` bridging:
+      - Incoming: SSE lines → framed messages → sink.add(String) to `Peer`.
+      - Outgoing: `add(String json)` → POST to preferred session endpoint with redirect handling.
+      - Re-subscribe on SSE disconnect with exponential backoff.
+  - [ ] __Edit__ `lib/Services/mcp_service.dart`
+    - Replace custom HTTP/SSE request routing with `json_rpc_2.Peer` over `HttpSseStreamChannel`.
+    - Keep WS path unchanged; both transports use a unified `_sendRequestViaPeer()`.
+    - Gate verbose SSE logs behind a debug flag.
 
-- __Create__ `test/chat_provider_tool_call_test.dart`
-  - Simulate stream containing a `TOOL_CALL:` line; assert `TOOL_RESULT:` insertion and resumed generation.
+- [ ] __Resilience: reconnect + heartbeat__
+  - [ ] __Edit__ `lib/Services/mcp_service.dart`
+    - WS: exponential backoff reconnect; optional `$/ping` or benign request every 30s; drop and reconnect on timeout.
+    - SSE: backoff for subscribe; POST watchdog with timeout and retry.
+    - Expose connection health in `connectionStates()` with reason codes.
 
-- __Feasibility__: High. Use mock channels and injected dependencies. Web platform tests run on VM; no UI needed.
+- [ ] __Settings UX enhancements__
+  - [ ] __Edit__ `lib/Pages/settings_page/subwidgets/mcp_settings.dart`
+    - Add Auto-discovery (desktop/mobile): simple host:port scan dialog; populate candidates list with toggles.
+    - Add per-chat enablement toggle stencil in row UI (stored globally for now; wires per-chat later).
+  - [ ] __Create__ `lib/Pages/chat_page/subwidgets/configure_chat_tools_dialog.dart`
+    - Modal to select tools per chat from available servers; persists minimal selection on chat metadata.
+  - [ ] __Create__ `lib/Models/agent_profile.dart` and __Edit__ `lib/Pages/settings_page/agent_profiles.dart`
+    - JSON-backed profile scaffold: name + selected servers/tools; selectable later in UX polish.
 
+- [ ] __Logging hygiene__
+  - [ ] __Edit__ `lib/Services/mcp_service.dart`
+    - Introduce `bool mcpDebugLogs` (in settings or const) to reduce logs in release.
+    - Scrub auth tokens and querystrings containing secrets from logs.
+
+- [ ] __Docs upkeep__
+  - [ ] __Edit__ `/.mcp-docs/mcp-gateway-contract.md`
+    - Keep endpoint preference notes updated if gateway variants change.
+  - [ ] __Edit__ `/.mcp-docs/mcp-client-plan.md`
+    - Mark each subtask above as completed as we land code.
 
 ## Production Implementation Stages and Steps
 

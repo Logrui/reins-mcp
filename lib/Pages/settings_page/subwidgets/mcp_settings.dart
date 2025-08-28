@@ -120,8 +120,8 @@ class _McpServersSettingsState extends State<McpServersSettings> {
 
         return Chip(
           label: Text(label),
-          backgroundColor: color.withOpacity(0.15),
-          side: BorderSide(color: color.withOpacity(0.6)),
+          backgroundColor: color.withValues(alpha: 0.15),
+          side: BorderSide(color: color.withValues(alpha: 0.6)),
           avatar: CircleAvatar(backgroundColor: color, radius: 6),
           materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
           visualDensity: VisualDensity.compact,

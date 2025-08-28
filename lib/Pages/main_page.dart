@@ -16,13 +16,13 @@ class ReinsMainPage extends StatelessWidget {
         drawer: ChatDrawer(),
       );
     } else {
-      return _ReinsLargeMainPage();
+      return const _ReinsLargeMainPage();
     }
   }
 }
 
 class _ReinsLargeMainPage extends StatelessWidget {
-  const _ReinsLargeMainPage({super.key});
+  const _ReinsLargeMainPage();
 
   @override
   Widget build(BuildContext context) {

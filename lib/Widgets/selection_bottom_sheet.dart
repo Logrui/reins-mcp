@@ -141,7 +141,9 @@ class _SelectionBottomSheetState<T> extends State<SelectionBottomSheet<T>> {
             return RadioListTile(
               title: Text(item.toString()),
               value: item,
+              // ignore: deprecated_member_use (temporary: migrate to RadioGroup later)
               groupValue: _selectedItem,
+              // ignore: deprecated_member_use (temporary: migrate to RadioGroup later)
               onChanged: (value) {
                 setState(() {
                   _selectedItem = value;

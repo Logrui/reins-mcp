@@ -4,13 +4,48 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart' as io;
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:json_rpc_2/json_rpc_2.dart' as rpc;
 
 import 'package:reins/Models/mcp.dart';
+import 'package:reins/Services/http_sse_channel.dart';
 
 enum McpConnectionState { disconnected, connecting, connected, error }
+
+
+/// Lightweight MessageChannel wrapper around HttpSseStreamChannel for lifecycle management
+class HttpPeerChannel implements MessageChannel {
+  final HttpSseStreamChannel _sse;
+  HttpPeerChannel(this._sse);
+
+  @override
+  Stream<dynamic> get stream => _sse.stream;
+
+  @override
+  MessageSink get sink => _HttpPeerSink(_sse);
+
+  @override
+  Future<void> close() async {
+    await _sse.dispose();
+  }
+}
+
+class _HttpPeerSink implements MessageSink {
+  final HttpSseStreamChannel _sse;
+  _HttpPeerSink(this._sse);
+
+  @override
+  void add(dynamic data) {
+    // Not used when routing via Peer; keep as a fallback.
+    final String payload = data is String ? data : jsonEncode(data);
+    _sse.sink.add(payload);
+  }
+
+  @override
+  Future<void> close() async {
+    // sink lifecycle handled by channel dispose
+  }
+}
 
 /// Simplified MCP Service supporting only HTTP and WebSocket transports
 /// Compatible with Web, iOS, and Windows Desktop platforms
@@ -24,6 +59,84 @@ class McpService extends ChangeNotifier {
   final Map<String, rpc.Peer> _wsPeers = {};
   final Uuid _uuid = const Uuid();
   final StreamController<Map<String, McpConnectionState>> _stateController = StreamController.broadcast();
+  // Heartbeat and reconnect state
+  final Map<String, Timer> _heartbeatTimers = {};
+  final Map<String, int> _wsRetryCounts = {};
+  final Map<String, Uri> _endpointByServer = {};
+  final Map<String, String?> _authByServer = {};
+
+  // --- Heartbeat & Reconnect ---
+  void _startHeartbeat(String serverUrl, {Duration period = const Duration(seconds: 30)}) {
+    _heartbeatTimers[serverUrl]?.cancel();
+    _heartbeatTimers[serverUrl] = Timer.periodic(period, (_) async {
+      await _heartbeat(serverUrl);
+    });
+  }
+
+  Future<void> _heartbeat(String serverUrl) async {
+    final peer = _wsPeers[serverUrl];
+    // Only WS needs explicit heartbeat; HTTP/SSE path uses persistent SSE
+    if (peer == null) return;
+    try {
+      // Use a benign ping; if method unsupported, it's still a live connection
+      await peer.sendRequest(r'$/ping', {}).timeout(const Duration(seconds: 10));
+      // success: reset retry counter
+      _wsRetryCounts[serverUrl] = 0;
+    } on TimeoutException {
+      debugPrint('MCP heartbeat timeout for $serverUrl');
+      _scheduleWsReconnect(serverUrl);
+    } on rpc.RpcException catch (e) {
+      if (e.code == -32601) {
+        // Method not found -> treat as alive
+        _wsRetryCounts[serverUrl] = 0;
+      } else {
+        _scheduleWsReconnect(serverUrl);
+      }
+    } catch (e) {
+      _scheduleWsReconnect(serverUrl);
+    }
+  }
+
+  void _scheduleWsReconnect(String serverUrl) {
+    final uri = _endpointByServer[serverUrl];
+    if (uri == null) return;
+    if (!(['ws', 'wss'].contains(uri.scheme))) return;
+    // Avoid duplicate reconnect floods
+    if (_states[serverUrl] == McpConnectionState.connecting) return;
+    _setState(serverUrl, McpConnectionState.connecting);
+    final attempt = (_wsRetryCounts[serverUrl] ?? 0).clamp(0, 5);
+    final delay = Duration(seconds: [1, 2, 4, 8, 16, 32][attempt]);
+    _wsRetryCounts[serverUrl] = attempt + 1;
+    debugPrint('MCP WS reconnect to $serverUrl in ${delay.inSeconds}s');
+    Timer(delay, () async {
+      try {
+        // tear down old channel if any
+        await _channels[serverUrl]?.close();
+        final channel = await _connectWebSocket(uri, _authByServer[serverUrl]);
+        _channels[serverUrl] = channel;
+        if (channel is WebSocketMessageChannel) {
+          final ws = channel.channel;
+          final peer = rpc.Peer(ws.cast<String>());
+          _wsPeers[serverUrl] = peer;
+          peer.listen();
+          peer.done.whenComplete(() {
+            if (_channels[serverUrl] is WebSocketMessageChannel) {
+              _scheduleWsReconnect(serverUrl);
+            }
+          });
+        }
+        final ok = await _initialize(serverUrl);
+        if (!ok) throw Exception('Initialize failed after reconnect');
+        _setState(serverUrl, McpConnectionState.connected);
+        _wsRetryCounts[serverUrl] = 0;
+        _startHeartbeat(serverUrl);
+        await _listToolsForServer(serverUrl);
+      } catch (e) {
+        debugPrint('MCP WS reconnect failed for $serverUrl: $e');
+        _scheduleWsReconnect(serverUrl);
+      }
+    });
+  }
 
   McpConnectionState getState(String serverUrl) => _states[serverUrl] ?? McpConnectionState.disconnected;
   bool isConnected(String serverUrl) => getState(serverUrl) == McpConnectionState.connected;
@@ -53,6 +166,11 @@ class McpService extends ChangeNotifier {
 
     _setState(serverUrl, McpConnectionState.connecting);
     _lastErrors.remove(serverUrl);
+    // keep endpoint and auth for reconnects
+    try {
+      _endpointByServer[serverUrl] = Uri.parse(serverUrl);
+      _authByServer[serverUrl] = authToken;
+    } catch (_) {}
 
     try {
       final uri = Uri.parse(serverUrl);
@@ -63,35 +181,25 @@ class McpService extends ChangeNotifier {
         channel = await _connectWebSocket(uri, authToken);
       } else if (uri.scheme == 'http' || uri.scheme == 'https') {
         // HTTP transport
-        channel = await _connectHttp(uri, authToken);
+        channel = await _connectHttp(uri, authToken, serverUrl);
       } else {
         throw Exception('Unsupported protocol: ${uri.scheme}. Only HTTP and WebSocket are supported.');
       }
 
       _channels[serverUrl] = channel;
 
-      // For HTTP channels, manually listen for JSON-RPC messages.
-      // For WebSocket channels, json_rpc_2 Peer will handle messaging.
-      if (channel is! WebSocketMessageChannel) {
-        channel.stream.listen(
-          (message) => _handleMessage(serverUrl, message),
-          onError: (error) {
-            debugPrint('MCP connection error for $serverUrl: $error');
-            _lastErrors[serverUrl] = error.toString();
-            _setState(serverUrl, McpConnectionState.error);
-            disconnect(serverUrl);
-          },
-          onDone: () {
-            debugPrint('MCP connection closed for $serverUrl');
-            disconnect(serverUrl);
-          },
-        );
-      } else {
-        // Create and start a JSON-RPC Peer for WebSocket transport
+      // For WebSocket channels, create a JSON-RPC Peer.
+      if (channel is WebSocketMessageChannel) {
         final ws = channel.channel;
         final peer = rpc.Peer(ws.cast<String>());
         _wsPeers[serverUrl] = peer;
         peer.listen();
+        // Reconnect on peer completion/close
+        peer.done.whenComplete(() {
+          if (_channels[serverUrl] is WebSocketMessageChannel) {
+            _scheduleWsReconnect(serverUrl);
+          }
+        });
       }
 
       // Initialize MCP connection
@@ -103,6 +211,7 @@ class McpService extends ChangeNotifier {
       }
 
       _setState(serverUrl, McpConnectionState.connected);
+      _startHeartbeat(serverUrl);
       await _listToolsForServer(serverUrl);
       notifyListeners();
     } catch (e) {
@@ -135,7 +244,7 @@ class McpService extends ChangeNotifier {
   }
 
   /// Connect via HTTP
-  Future<MessageChannel> _connectHttp(Uri uri, String? authToken) async {
+  Future<MessageChannel> _connectHttp(Uri uri, String? authToken, String serverUrl) async {
     final headers = <String, String>{};
     if (authToken != null && authToken.isNotEmpty) {
       headers['Authorization'] = 'Bearer $authToken';
@@ -143,7 +252,12 @@ class McpService extends ChangeNotifier {
 
     debugPrint('MCP HTTP connect -> $uri');
     final client = http.Client();
-    return HttpMessageChannel(client, uri, headers);
+    // Use StreamChannel-based HTTP/SSE channel and wrap with json_rpc_2.Peer
+    final sse = HttpSseStreamChannel(client, uri, headers);
+    final peer = rpc.Peer(sse);
+    _wsPeers[serverUrl] = peer; // unified path uses Peer for HTTP as well
+    peer.listen();
+    return HttpPeerChannel(sse);
   }
 
   void disconnect(String serverUrl) {
@@ -154,6 +268,8 @@ class McpService extends ChangeNotifier {
         peer.close();
       } catch (_) {}
     }
+    // Stop heartbeat
+    _heartbeatTimers.remove(serverUrl)?.cancel();
     _channels[serverUrl]?.close();
     _channels.remove(serverUrl);
     _serverTools.remove(serverUrl);
@@ -288,37 +404,7 @@ class McpService extends ChangeNotifier {
     return completer.future;
   }
 
-  /// Handle incoming messages
-  void _handleMessage(String serverUrl, dynamic message) {
-    try {
-      final Map<String, dynamic> json;
-      if (message is String) {
-        json = jsonDecode(message);
-      } else if (message is Map<String, dynamic>) {
-        json = message;
-      } else {
-        debugPrint('MCP received unexpected message type: ${message.runtimeType}');
-        return;
-      }
-
-      final id = json['id']?.toString();
-      if (id != null && _pendingRequests.containsKey(id)) {
-        // Response to our request
-        final completer = _pendingRequests.remove(id);
-        _requestServerById.remove(id);
-        
-        if (completer != null && !completer.isCompleted) {
-          final response = McpResponse.fromJson(json);
-          completer.complete(response);
-        }
-      } else {
-        // Notification or other message
-        debugPrint('MCP notification: ${json['method']}');
-      }
-    } catch (e) {
-      debugPrint('Failed to handle MCP message: $e');
-    }
-  }
+  
 
   /// Call a tool
   Future<McpToolResult> call(String serverUrl, String toolName, Map<String, dynamic> arguments, {Duration? timeout}) async {
@@ -426,7 +512,7 @@ class HttpMessageChannel implements MessageChannel {
   String _currentEvent = '';
 
   HttpMessageChannel(this._client, this._baseUri, this._headers) {
-    _sink = HttpMessageSink(_client, _baseUri, _headers, _controller, this);
+    _sink = HttpMessageSink(_client, _baseUri, _headers, this);
     _startSSEConnection();
   }
 
@@ -751,10 +837,9 @@ class HttpMessageSink implements MessageSink {
   final http.Client _client;
   final Uri _baseUri;
   final Map<String, String> _headers;
-  final StreamController<dynamic> _controller;
   final HttpMessageChannel _channel;
 
-  HttpMessageSink(this._client, this._baseUri, this._headers, this._controller, this._channel);
+  HttpMessageSink(this._client, this._baseUri, this._headers, this._channel);
 
   @override
   void add(dynamic data) {

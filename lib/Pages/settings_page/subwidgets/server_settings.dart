@@ -293,7 +293,6 @@ class _ConnectionStatusIndicator extends StatelessWidget {
   final Color color;
 
   const _ConnectionStatusIndicator({
-    super.key,
     required this.color,
   });
 
@@ -317,9 +316,7 @@ class _ConnectionStatusIndicator extends StatelessWidget {
 }
 
 class _OllamaInfoBottomSheet extends StatelessWidget {
-  const _OllamaInfoBottomSheet({
-    super.key,
-  });
+  const _OllamaInfoBottomSheet();
 
   @override
   Widget build(BuildContext context) {

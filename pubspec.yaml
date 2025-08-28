@@ -35,6 +35,7 @@ dependencies:
   http: ^1.2.2
   async: ^2.11.0
   json_rpc_2: ^3.0.2
+  stream_channel: ^2.1.2
 
   # State management solution
   provider: ^6.1.2
@@ -93,6 +94,10 @@ dev_dependencies:
 
   # Testing framework
   test: ^1.25.7
+
+  # Required by tests that import platform interfaces
+  path_provider_platform_interface: ^2.1.2
+  plugin_platform_interface: ^2.1.8
 
   # Create custom icons for Android and iOS
   flutter_launcher_icons: ^0.14.1

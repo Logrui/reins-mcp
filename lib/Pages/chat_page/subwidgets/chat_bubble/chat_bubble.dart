@@ -60,7 +60,7 @@ class ChatBubble extends StatelessWidget {
 class _ChatBubbleBody extends StatelessWidget {
   final OllamaMessage message;
 
-  const _ChatBubbleBody({super.key, required this.message});
+  const _ChatBubbleBody({required this.message});
 
   @override
   Widget build(BuildContext context) {

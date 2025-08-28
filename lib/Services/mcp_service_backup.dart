@@ -1,10 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' show ChangeNotifier, kIsWeb, debugPrint;
 import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart' as io;
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 
 import 'package:reins/Models/mcp.dart';
@@ -760,7 +759,7 @@ class McpService extends ChangeNotifier {
         return;
       }
       if (json is Map && json.containsKey('id')) {
-        final map = (json as Map);
+        final map = json;
         final idStr = '${map['id']}';
         final response = McpResponse(
           id: idStr,
