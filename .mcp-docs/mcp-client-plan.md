@@ -1,692 +1,345 @@
-# Reins MCP Client and Tools Support — Living Document
+# Reins MCP Client — Living Plan
 
-This document tracks the plan, design, and implementation steps to turn Reins into an MCP (Model Context Protocol) client with tool-calling support. It is structured as phased milestones: a Minimum Viable Product (MVP) and Production polish.
+This document tracks the plan, design, and implementation of MCP (Model Context Protocol) client and tool-calling support in Reins. 
 
+---
 
-## Architecture Overview (Flutter + Reins)
+## 1. Project Overview & Status
+
+### Goal
+
+Enable Reins to act as an MCP client, allowing LLMs to execute tools exposed by connected MCP servers. The model will request a tool, Reins will execute it via MCP, and the result will be fed back into the conversation to generate a final answer.
+
+### Current Status
+
+- __MVP Complete__: The core tool-calling loop is functional across WS and HTTP/SSE. Structured tool-calls are primary with sentinel fallback. Chat stream interception and Hive persistence are in place.
+- __UI/UX Enhancements__: "Thinking" UI for tool calls shipped. Data model uses structured objects (`McpToolCall`, `McpToolResult`). Dedicated `tool` role is supported end-to-end (model, provider, persistence).
+- __Streaming Lifecycle Fixes__: Implemented thinking re-enable per loop, `supportsTools` cache, and explicit cancellation flags to stabilize multi-turn flows.
+- __Deterministic Transcript__: `ChatProvider` now appends assistant messages independent of UI state and fixes null-safety around tool-call handling.
+- __Tests Passing__: Multi-turn tool flow regression test now passes (two sequential tool calls + final answer).
+- __Focus__: Schema validation integrated; next priorities: observability and settings polish (last-error tooltip, status badges). Regression tests expanded for cancel/error paths.
+
+### Immediate Next Actions
+
+- [x] __Implement "Thinking" UI (HIGH)__: The chat now visualizes in-progress tool calls.
+- [x] __Enhance Data Model (MED)__: The data model now uses structured `McpToolCall` and `McpToolResult` objects, eliminating raw string parsing for tool calls.
+- [x] __Tests (MED)__: Added a provider-level test to validate the new tool-call orchestration flow.
+- [x] __Step 1 — Provider deterministic transcript & persist-before-call__: Implemented in `ChatProvider._streamOllamaMessage()`; assistant messages are always appended for the associated chat, tool-call assistant messages are persisted before execution, and null-safety/logging improved. Validated by passing multi-turn test (2025-08-29).
+
+### Next Steps (short)
+
+- __Run Gateway streaming path__: Ensure Docker MCP Gateway is running with `--transport streaming` at `http://localhost:7999`.
+- __Reconnect + verify logs__: Look for `MCP HTTP(streaming) connect ->`, `MCP initialize OK`, and `MCP tools/list` totals.
+- __Full restart if needed__: If no initialize logs appear, perform a full app restart (not hot reload).
+- __Diagnose quickly__: Wire Settings tooltip to show `McpService.getLastError(serverUrl)` for last connection error.
+- __Selector param__: If tools remain empty, check whether the gateway requires a server selector in `tools/list`; add if necessary.
+- __Add more regressions__: Cover timeout path for tool calls to complement the passing cancellation and server error tests.
+
+---
+
+## 2. Roadmap
+
+### Short-Term: UI Polish & Data Model
+
+- [x] __Logging Hygiene__: Gated verbose logs behind a debug flag and scrubbed secrets from output.
+- [x] __Settings UI Polish__: Improved validation, error surfacing, and added tooltips in `lib/Pages/settings_page/subwidgets/mcp_settings.dart`.
+- [x] __Spinner/Cancel__: Show an inline spinner while a tool is executing and provide a mechanism to cancel the operation.
+
+### Long-Term: Protocol & Architecture Refactoring
+
+- [x] __Adopt Structured Tool-Call Protocol__: Transitioned from `TOOL_CALL:`/`TOOL_RESULT:` sentinels to structured `tool_calls`/`tool_results` where supported; fallback retained for non-capable models. System prompt and `OllamaService` updated accordingly.
+
+- [x] __Refactor ChatProvider for Recursive Dispatch__: Provider now completes a generation, executes tools, appends results, and starts a new generation with updated history. Improves reliability over mid-stream resumption.
+
+- [ ] __Introduce `tool` Role__: Add a dedicated `tool` role to the `OllamaMessage` model and database for a fully structured transcript and distinct UI rendering.
+
+### Future Enhancements
+
+- __Advanced Transports__: Add stdio transport for managing local MCP servers on desktop.
+- __Authentication__: Support per-server authentication (API keys, tokens) with secure storage.
+- __Schema & Validation__: Use tool input JSON Schemas to validate arguments and optionally build a UI for argument entry.
+- __Observability__: Create a developer panel or status page to inspect MCP traffic and connection health.
+
+### Gaps to Fully Fledged Support
+
+- __Multi-turn stability__: Harden recursive tool-call orchestration for two-or-more sequential tool calls; eliminate timeouts in tests and in real flows.
+- __Structured transcript fidelity__: Introduce a dedicated `tool` role in `OllamaMessage` and persist it so tool calls/results render distinctly from assistant messages.
+- __Schema-aware validation__: Validate tool arguments against MCP JSON Schemas; show inline validation errors and prevent bad calls.
+- __Observability & diagnostics__: Add a Dev panel to show initialize/logs, tools/list, tools/call traffic and last errors per server.
+- __Settings polish & auth__: Last-error tooltip wired to `McpService`, per-server auth tokens, connection status badges.
+- __Web transport hardening__: Prefer native EventSource for SSE on web, enforce WSS under HTTPS; document CORS/proxy setup.
+ - __HTTP/SSE hardening__: Client now tries multiple SSE endpoints, follows redirects, propagates cookies, and sets dual Accept header for JSON POSTs.
+- __Desktop stdio roadmap__: Plan stdio transport for local servers (Windows/macOS/Linux), feature-gated.
+- __UX improvements__: Expandable tool results, copy/export, truncation with “show more”, compact “Tools used” summary per turn.
+
+### Concrete Next Actions
+
+- [x] __Fix multi-turn test & add regression__: `chat_provider_tool_flow_test.dart` stabilized to simulate two sequential tool calls before final answer; deterministic fakes and consistent DB naming verified. (Completed 2025-08-29)
+- [x] __Step 1 — Provider deterministic transcript & persist-before-call__: Landed and verified by tests. (Completed 2025-08-29)
+- [x] __Add `tool` role & persistence__: `OllamaMessage` supports `tool` role; `DatabaseService` schema (v3) persists `role` including `tool`, plus `tool_call` and `tool_result`. `ChatProvider` creates tool-role messages for calls/results. (Completed 2025-08-29)
+- [x] __Implement schema validation__: `JsonSchemaValidator` (subset) added; `McpService.validateToolArguments()` exposed; `ChatProvider._executeToolCall()` short-circuits invalid args with inline error.
+- [ ] __Observability panel__: Build a developer panel showing recent MCP traffic and last errors; add log toggles.
+- [ ] __Settings polish__: Last-error tooltip from `McpService.getLastError(serverUrl)`, per-server auth tokens, status badges.
+- [ ] __Web SSE path__: Use `dart:html EventSource` under web builds; enforce WSS; add CORS/proxy notes to README.
+- [x] __HTTP/SSE transport hardening__: Endpoint fallbacks (`/sse`, base, `/events`, `/stream`, etc.), GET/POST attempts, redirect-follow, cookie propagation, and `Accept: application/json, text/event-stream` on POSTs.
+- [ ] __Make SSE path configurable__: Add custom SSE path in Settings; try this first when connecting.
+- [ ] __Toggle for POST-to-open__: Some gateways require POST to establish SSE; surface a setting to force POST-first.
+- [ ] __Plan desktop stdio__: Spike a prototype behind a feature flag; scope OS-specific constraints and packaging.
+- [ ] __Add cancellation & error-path tests__: Server error and user-cancel tests implemented; add timeout regression next.
+
+#### Action Items — Stabilize Multi‑Turn Tool Flow Test
+
+1. __Override model capability in test fake__
+   - File: `test/chat_provider_tool_flow_test.dart`
+   - In `_FakeOllamaService`, override `getModel(String name)` to return an `OllamaModel` with `supportsTools: true` (matching `listModelsWithCaps()`).
+
+2. __(Optional) Add provider test seam__
+   - File: `lib/Providers/chat_provider.dart`
+   - Add `@visibleForTesting void setSupportsToolsForModel(String model, bool value)` that writes into `_supportsToolsCache`.
+   - Use it in the test to avoid any capability lookup flakiness.
+
+3. __Use seam in test (if added)__
+   - After creating the chat and before `sendPrompt()`, call `provider.setSupportsToolsForModel('llama3.2:latest', true)`.
+
+4. __Run the single test__
+   - Command: `dart test test/chat_provider_tool_flow_test.dart -p vm`
+   - Expect `ollama.chatStreamCalls == 3` and final message `"Final response: second"`.
+
+5. __Add a regression variant__
+   - Duplicate the test with two sequential tool calls using different args; assert order and results.
+
+6. __Timeout hygiene__
+   - If needed, increase the completer wait from 5s to 8–10s; keep overall test timeout at ~10–15s.
+
+---
+
+## 3. Architecture & Design Reference
+
+### Architecture Overview (Flutter + Reins)
 
 - __Flutter cross-platform__: One Dart codebase targeting iOS, Android, macOS, Windows, Linux, and Web. UI built with Flutter widgets; business logic and services are pure Dart where possible.
-- __Current services & state__:
-  - `lib/Services/ollama_service.dart`: HTTP/streaming to model server.
-  - `lib/Providers/chat_provider.dart`: orchestrates chat, streaming, and state.
-  - Hive-backed settings and local DB in `lib/Services/database_service.dart`.
-- __Planned MCP integration__: Add `McpService` (WebSocket + JSON-RPC 2.0). Intercept tool calls in `ChatProvider` during token stream and resume generation after injecting results.
-- __Feasibility summary__:
-  - Using the current architecture is viable. Provider-based orchestration is a good fit for intercepting `TOOL_CALL:` mid-stream.
-  - `web_socket_channel` works across mobile/desktop/web. On Web, ensure WS endpoints use `wss://` when app is served over HTTPS to avoid mixed content.
-  - Hive: supported across platforms; verify box schemas for `mcpServers` on Web and Desktop.
-  - Platform caveats: network permissions (Android/iOS), self-signed certs in dev, and CORS/Mixed Content for Web. All manageable at app config level.
+- __Core Services & State__:
+  - `lib/Services/ollama_service.dart`: Handles HTTP/streaming communication with the model server.
+  - `lib/Providers/chat_provider.dart`: Orchestrates the entire chat lifecycle, including streaming, state management, and tool-call interception.
+  - `lib/Services/database_service.dart`: Manages persistence with Hive and SQLite.
+  - `lib/Services/mcp_service.dart`: A dedicated service for MCP communication (WebSocket + JSON-RPC 2.0).
 
-### Platform constraints overview
-- __Web__: Current codebase uses `dart:io` (`main.dart`, `database_service.dart`, `ollama_message.dart`) and `sqflite`; these block web builds. Web requires HTTPS + WSS and no stdio or port scanning.
-- __Mobile__: Network permissions and ATS for HTTP to localhost; no stdio on iOS; limited on Android.
-- __Desktop__: Easiest environment. Full WS and optional stdio in Production.
+### High-Level Design
 
-
-## Current App Architecture (Reference)
-
-- Core entry: `lib/main.dart`
-- Chat orchestration: `lib/Providers/chat_provider.dart`
-- Model/API integration: `lib/Services/ollama_service.dart`
-- Persistence: `lib/Services/database_service.dart`
-- Message model: `lib/Models/ollama_message.dart`
-- Path utility: `lib/Constants/path_manager.dart`
-- Pages/UI: `lib/Pages/`
-
-Today, chat flows through `ChatProvider._streamOllamaMessage()` which calls `OllamaService.chatStream()` to stream tokens from an Ollama server.
-
-
-## Goal
-
-Enable Reins to act as an MCP client and execute tools exposed by connected MCP servers during chat. The model will request a tool; Reins will execute it via MCP and feed the result back into the ongoing conversation.
-
-
-## Plan Overview and Reading Guide
-
-- __Architecture & Design__: `Current App Architecture`, `High-Level Design`.
-- __Technical details__: `Technical Design Details` (API sketches, touch points, persistence).
-- __Implementation__: `MVP Implementation Stages` then `Production Implementation Stages`.
-- __Roadmap__: Mid/Long-term ideas beyond staged delivery.
-- __Milestones & Next__: Success criteria and immediate next actions.
-
-
-## High-Level Design
-
-- Add an MCP service layer to connect to MCP servers (initially WebSocket transport) and expose methods to list tools and call tools.
-- Use a simple, reliable tool-call protocol with the LLM via text sentinel lines (MVP), since Ollama’s REST API does not natively accept a `tools` parameter:
-  - Model emits: `TOOL_CALL: {"server":"<srv>","name":"<tool>","args":{...}}`
-  - App replies: `TOOL_RESULT: {"name":"<tool>","result":<any>}`
-- Inject tool awareness into the system prompt (list tools, usage rules) so the model knows how to request tools.
-- Intercept tool calls in the streaming loop, execute via MCP, append the result, and continue the chat.
-
-### Feasibility notes
-- __Protocol__: Text sentinels are transport-agnostic and compatible with current Ollama REST streaming model. Low risk.
-- __Service layering__: A dedicated `McpService` cleanly composes with `ChatProvider`. No architectural refactor required.
-- __Resumption__: Restarting generation with appended `TOOL_RESULT:` mirrors existing retry logic; feasible with current `OllamaService.chatStream()`.
- - __LLM adherence__: Risk that models deviate from exact `TOOL_CALL:` JSON. Mitigate via prompt appendix, examples, and tolerant parsing with clear error paths.
-
-
-## New Files to Add (MVP)
-
-- `lib/Services/mcp_service.dart`
-  - Manages connections to MCP servers (WebSocket first), JSON-RPC 2.0 messaging, `initialize`, `listTools`, `callTool`.
-- `lib/Models/mcp.dart`
-  - Data classes for `McpServerConfig`, `McpTool`, `McpToolCall`, `McpToolResult`.
-- `lib/Utils/tool_call_parser.dart`
-  - Parse `TOOL_CALL:` sentinel JSON and format `TOOL_RESULT:` payloads.
-- `lib/Constants/tool_system_prompt.dart`
-  - Renders a tool-aware system prompt appendix from a tool list.
-
-### Feasibility notes
-- __Pure Dart__: All four files are platform-agnostic Dart; safe across iOS/Android/Desktop/Web.
-- __WebSocket__: `web_socket_channel` supports required features; JSON-RPC 2.0 can be implemented atop it without extra deps.
-- __Testing__: These units are testable with mock channels and pure functions.
-
-
-## Existing Files to Update (MVP)
-
-- `lib/main.dart`
-  - Add `Provider(create: (_) => McpService())` and connect/load tools at startup.
-- `lib/Providers/chat_provider.dart`
-  - Before calling `OllamaService.chatStream()`, enrich the effective system prompt with the tool appendix.
-  - In `_streamOllamaMessage()`, detect `TOOL_CALL:` lines, execute tool via `McpService`, inject `TOOL_RESULT:` as a message, then resume generation with updated history.
-- `lib/Pages/settings_page/subwidgets/server_settings.dart` (optional for MVP)
-  - Add text fields to manage MCP server endpoints (store in Hive `settings` as `mcpServers`).
-
-### Additional feasibility notes
-- __Stream orchestration__: Implement cancellation + restart to avoid duplicate tokens when pausing for a tool call.
-- __Web build goal__: If targeting web, add `kIsWeb` guards and conditional imports in files that use `dart:io` and `sqflite`.
-
-
-## MVP: Detailed Scope (Feature Checklist)
-
-- __MCP transport__
-  - WebSocket client (`web_socket_channel`).
-  - JSON-RPC 2.0 request/response with id routing and error handling.
-- __MCP methods__
-  - `initialize` (capabilities negotiation minimal viable).
-  - `tools/list` (list available tools with schemas if available).
-  - `tools/call` (invoke a tool by name with args; return result or error).
-- __Tool-call protocol (model-facing)__
-  - System prompt appendix listing tools and strict instructions for outputting exactly one `TOOL_CALL:` JSON line when a tool is needed.
-  - Parser that detects and parses `TOOL_CALL:` in streamed content (supports mid-stream detection; buffer a line until valid JSON parses).
-  - After execution, inject `TOOL_RESULT:` line as a new assistant message to context; resume generation to let the model craft the final user-facing response.
-- __State & persistence__
-  - Cache tool list in memory within `McpService`. Persist server endpoints in Hive `settings`.
-- __UI__
-  - Minimal: render `TOOL_CALL:` and `TOOL_RESULT:` as plain assistant text (MVP avoids new roles/UI until later).
-- __Errors__
-  - If MCP call fails, return a `TOOL_RESULT:` with an error field and let the model handle it.
-
-
-## Production: Enhancements and Polish
-
-- __UX/UI__
-  - Distinct visual style for tool requests/results (monospace blocks, icons, compact cards).
-  - Show an inline spinner while a tool is executing; allow cancel.
-  - Per-chat tool visibility/enable/disable controls.
-- __Roles & structure__
-  - Introduce a dedicated `tool` role in the message model and renderer.
-  - Maintain a structured transcript (separate from display text) for `tool_call` and `tool_result` segments.
-- __Transport & security__
-  - Add stdio transport (spawn processes on desktop) with sandboxing.
-  - Authentication support (API keys, tokens) per server.
-- __Schema & validation__
-  - Use tool input JSON Schemas to validate and assist argument building.
-  - Optional UI to preview/confirm arguments before execution.
-- __Reliability__
-  - Robust JSON streaming parser across partial lines and multiple tool calls.
-  - Backoff/retry policy for MCP calls; deadline and budget controls per call.
-- __Observability__
-  - Structured logs for tool lifecycle (requested → executing → result/error).
-  - Dev panel to inspect MCP traffic (toggle via debug settings).
-- __Testing__
-  - Integration tests covering tool loops, error paths, cancellations.
-  - Snapshot tests for UI rendering of tool cards/rows.
-
-
-## Technical Design Details
-
-### API Sketches (MVP)
-
-#### Models (`lib/Models/mcp.dart`)
-
-```dart
-class McpServerConfig {
-  final String name; // e.g., "local"
-  final Uri endpoint; // e.g., ws://localhost:3001
-  final String? authToken;
-  McpServerConfig({required this.name, required this.endpoint, this.authToken});
-}
-
-class McpTool {
-  final String server;
-  final String name;
-  final String? description;
-  final Map<String, dynamic>? inputSchema;
-  McpTool({required this.server, required this.name, this.description, this.inputSchema});
-}
-
-class McpToolCall {
-  final String server;
-  final String name;
-  final Map<String, dynamic> args;
-  McpToolCall({required this.server, required this.name, required this.args});
-}
-
-class McpToolResult {
-  final dynamic result;
-  final String? error;
-  McpToolResult({this.result, this.error});
-}
-```
-
-#### MCP Service (`lib/Services/mcp_service.dart`)
-
-```dart
-enum McpConnectionState { disconnected, connecting, connected, error }
-
-abstract class McpService {
-  Future<void> connectAll(List<McpServerConfig> servers);
-  Future<void> disconnectAll();
-
-  // Connection state changes per server (optional to observe in UI)
-  Stream<Map<String, McpConnectionState>> connectionStates();
-
-  // List tools for all servers or a specific server
-  Future<List<McpTool>> listTools({String? server});
-
-  // Invoke tool with optional timeout. Errors mapped into McpToolResult.error
-  Future<McpToolResult> call(
-    String server,
-    String tool,
-    Map<String, dynamic> args, {
-    Duration? timeout,
-  });
-}
-```
-
-#### Tool Call Protocol Utilities (`lib/Utils/tool_call_parser.dart`)
-
-```dart
-const String kToolCallPrefix = 'TOOL_CALL:';
-const String kToolResultPrefix = 'TOOL_RESULT:';
-
-// Detects and parses the first TOOL_CALL in the provided text buffer.
-// Returns null if not found or invalid JSON.
-McpToolCall? parseToolCall(String text);
-
-// Formats a tool result line for the transcript
-String formatToolResult(String toolName, dynamic result, {String? error});
-```
-
-#### System Prompt Appendix (`lib/Constants/tool_system_prompt.dart`)
-
-- Function that renders a concise list of tools with usage instructions and the exact sentinel format to use.
-
+- __MCP Service Layer__: The `McpService` connects to MCP servers (via WebSocket or HTTP/SSE) and exposes methods to list and call tools.
+- __Tool-Call Protocol (Current)__:
+  - __Primary (Structured)__: When the model supports tools, we use structured `tool_calls` from the model and inject `tool_results` back into the transcript via `OllamaMessage` fields (`toolCall`, `toolResult`).
+  - __Fallback (Sentinel)__: If structured tools are not supported, we fall back to text sentinels:
+    - Model emits: `TOOL_CALL: {"server":"<srv>","name":"<tool>","args":{...}}`
+    - App replies: `TOOL_RESULT: {"name":"<tool>","result":<any>}`
+- __Prompt Injection__: The system prompt is dynamically augmented with a list of available tools and usage instructions.
+- __Orchestration__: `ChatProvider` runs a clean loop per generation: complete stream, execute any tool calls via `McpService`, append results, then start a new generation with updated history (recursive dispatch). This replaces brittle mid-stream resumption.
 
 ### Touch Points in `ChatProvider`
 
-- When preparing the chat request:
-  - Compute `effectiveSystemPrompt = currentChat.systemPrompt + toolSystemPrompt(tools)`
-- In `_streamOllamaMessage()` loop:
-  - Accumulate streamed content; when a line starts with `TOOL_CALL:`, attempt JSON parse.
-  - On success: cancel current stream; run MCP call; append `TOOL_RESULT:` as a new assistant message; then start a new `chatStream` using the updated transcript so the model can finalize the answer.
-  - Add guard flags to prevent re-entrancy and ensure the first stream is fully cancelled before starting the next.
+- __Prepare request__: `effectiveSystemPrompt = chat.systemPrompt + toolSystemPrompt(availableTools)`.
+- __Stream loop__: Accumulate streamed content; when structured `tool_calls` appear or a `TOOL_CALL:` line is detected, stop the stream.
+- __Execute tool__: Call `McpService.call(server, tool, args)`; capture result/error.
+- __Inject result__: Append a `tool` result message (structured) or a `TOOL_RESULT:` assistant line (fallback).
+- __Restart generation__: Start a new generation with updated history (guard against re-entrancy; ensure prior stream cancelled).
 
+### Tool Usage Testing Plan
+
+Validate end-to-end tool calling with both structured tools and the sentinel fallback.
+
+- __Prerequisites__:
+  - `McpService` connected to at least one server exposing a simple tool (e.g., `echo`, `time.now`).
+  - System prompt includes the tool appendix from `lib/Constants/tool_system_prompt.dart`.
+- __Manual E2E Checklist__:
+  1. Start a new chat and verify tools are reflected in the system prompt (dev logs).
+  2. Ask a query that requires a tool, e.g., “What’s the current UTC time? Use a tool if needed.”
+  3. Structured path: model emits a `tool_calls` entry; fallback path: emits a `TOOL_CALL:` JSON line.
+  4. Execute MCP call; inject result (structured `tool_results` or `TOOL_RESULT:` line).
+  5. Start a new generation with the updated history; confirm assistant references the tool result.
+  6. Error path: break args or network; verify error result is injected and the model handles it gracefully.
+
+### Ollama Model Compatibility
+
+- __Detection__: We enrich models via `ollama.show` and compute `supportsTools` from `metadata.capabilities`. This is implemented in `lib/Services/ollama_service.dart` and surfaced through `listModelsWithCaps()`.
+- __Adherence__: Instruct-tuned models follow `TOOL_CALL:`/`TOOL_RESULT:` sentinels best. Best practice is to keep the temperature low (0.1–0.3) and include exemplars in the system prompt appendix.
 
 ### Data Persistence
 
-- Hive settings (`Hive.box('settings')`):
-  - `serverAddress` (existing)
-  - `mcpServers` (new): list of objects `{name, endpoint, authToken?}`
-- No schema migration required for settings; default to empty list if missing.
-- For Production P2 (`tool` role), plan a DB migration step to extend the role enum or remove the CHECK constraint and enforce in app logic.
-
-
-## Risks and Mitigations
-
-- __LLM adherence to protocol__: It might not always emit perfect `TOOL_CALL:` JSON.
-  - Mitigate with clear prompt instructions and strict examples.
-  - Parser tolerates whitespace and buffers incomplete lines.
-- __Transport variability__: Some MCP servers require stdio.
-  - Start with WebSocket; add stdio in Production phases.
-- __Latency__: Tool calls can increase round-trip time.
-  - Show spinner; consider timeouts; allow cancel.
- - __Web constraints__: HTTPS + WSS required; no stdio; no port scanning. Document dev reverse-proxy with valid certs.
- - __Large tool outputs__: Truncate or summarize `TOOL_RESULT:` to avoid blowing model context; provide expandable UI later.
- - __Stream orchestration__: Risk of duplicate/interleaved tokens. Use explicit cancellation and state machine in `ChatProvider`; add tests.
-
-
-## MVP Implementation Stages and Actionable Steps
-
-### Progress Update — 2025-08-25
-- [x] Stage 0 — Scaffolding: created `mcp.dart`, `mcp_service.dart`, `tool_call_parser.dart`, `tool_system_prompt.dart`; dependency `web_socket_channel` present in `pubspec.yaml`.
-- [x] Stage 1 — MCP Service: WebSocket JSON-RPC skeleton implemented; `tools/list` and `tools/call` wired; connection state stream exposed; reconnection/backoff TBD.
-- [x] Stage 2 — Prompt + Parser: system prompt appendix and strict sentinel parsing/formatting added.
-- [~] Stage 3 — ChatProvider orchestration: TOOL_CALL interception, cancel/resume, TOOL_RESULT injection implemented; guard flags/TODOs pending.
-- [ ] Stage 4 — Settings wiring: `mcpServers` UI + persistence not added yet.
-- [ ] Stage 5 — Tests: pending.
-
-### Progress Update — 2025-08-26
-- [x] Settings: Added MCP Server Name field and wired persistence in `lib/Pages/settings_page/subwidgets/mcp_settings.dart`.
-- [x] Settings Save: Now constructs `McpServerConfig(name, endpoint, authToken?)` and triggers disconnectAll → connectAll → listTools warmup.
-- [x] Back-compat: Made `McpServerConfig.fromJson(...)` tolerant to missing `name` by deriving it from endpoint (host or trimmed URL).
-- [x] Fixed compile error: "The named parameter 'name' is required" by supplying it where `McpServerConfig` is constructed.
-
-- [x] Settings UI: Added per-row connection status chip using `McpService.connectionStates()` and a live tools count + "View" dialog pulling from `McpService.getTools(serverUrl)`.
-- [ ] Tools Page: Create an "Available Tools" page aggregating tools across all servers with search/filter and copyable schemas.
-
-- [x] Transport: Added MCP `initialize` handshake before `tools/list`.
-- [x] Desktop WS: Use `IOWebSocketChannel` with `Sec-WebSocket-Protocol: jsonrpc` on desktop (keep default on Web). Added error logging for `tools/list`.
-- [ ] Transport: Support optional headers/subprotocols from `McpServerConfig` (auth, custom proto) if required by gateways.
-
-- [x] Startup Resilience: Defer MCP `connectAll` until after first frame; wrap in try/catch to avoid window crash on handshake errors.
-- [x] Global Guard: Set `FlutterError.onError` to log errors during startup.
-- [x] Endpoint Normalization: Convert `http`→`ws`, `https`→`wss`, and auto-try `/ws` path fallback.
-
-- [x] Create files: `mcp_service.dart`, `mcp.dart`, `tool_call_parser.dart`, `tool_system_prompt.dart`.
-- [x] Add dependency: `web_socket_channel` (and `uuid` already present) in `pubspec.yaml`.
-
-### Progress Update — 2025-08-27
-- [x] Initialize protocol: include `protocolVersion: "2024-11-05"` in `initialize` params and send `initialized` JSON-RPC notification after success.
-- [x] Diagnostics: log unexpected `tools/list` result shapes for easier debugging.
-- [x] Robust parsing: handle binary WebSocket messages by decoding UTF-8 before JSON parsing.
-- [x] Schema tolerance: make `McpTool.fromJson` accept `parameters`, `input_schema`, or `inputSchema`; default empty description/parameters.
-- [x] Auth headers & subprotocols: McpService now supports per-server Authorization Bearer header and configurable subprotocol preference; `connectAll` forwards `authToken`.
-- [x] Connection gating: do not mark as connected unless `initialize` succeeds; send `initialized` notification after success.
-- [x] Diagnostics: added verbose logs for connection attempts (URI, subprotocols, headers keys) and last-error caching per server.
-- [ ] UI: expose `lastErrors[server]` as tooltip in Settings (pending).
-- [x] Settings: ensure endpoint uses `/ws` path by default in UI to avoid 200 handshake.
-
-#### Addendum — 2025-08-27 (later)
-- [x] JSON-RPC batch handling: `_handleMessage()` now supports array responses by iterating each item.
-- [x] Initialize logging: log `MCP initialize OK` on success for clearer diagnostics.
-- [x] Tools list tolerance: accept result shapes `Map{tools|items|data}` or bare `List`; accept alt pagination keys `nextCursor|next|cursor|next_cursor`.
-- [x] Per-server fallback: when `tools/list` returns empty, try `servers/list` then call `tools/list` with `{server: <name>}` per server, with pagination.
-- [x] Timeouts: add 15s timeout to `tools/list` and 10s to `servers/list`, logging timeouts to `_lastErrors`.
-- [x] Extra logging: log request pages/cursors and first-page result keys; log final total tools count per server.
-
-### Progress Update — 2025-08-27 (Transports status)
-- [x] WebSocket + json_rpc_2: Wrapped WS channel with `json_rpc_2.Peer`; `initialize`, `tools/list`, `tools/call` flow via `peer.sendRequest()`.
-- [x] HTTP/SSE for Gateway: Implemented `HttpMessageChannel` and `HttpMessageSink` with SSE parsing, session endpoint discovery, and POST routing.
-  - Prefer emitted `/message?sessionId=<id>`; fallback to canonical `/sse?sessionid=<id>`; then `/message`, `/rpc`, base URL.
-  - Avoid double JSON encoding on POST; `Content-Type: application/json`; handle 307/302 redirects.
-- [x] Error handling and logging: Detailed SSE framing, session extraction logs, and response diagnostics.
-- [x] Platform coverage: Web, iOS, Windows Desktop supported for WS and HTTP/SSE.
-
-### Progress Update — 2025-08-27 (HTTP/SSE session + parsing fixes)
-- [x] SSE event framing: accumulate multi-line `data:` chunks and parse on blank line terminator per SSE spec.
-- [x] JSON unwrapping: handle envelopes `{event,data}`, `{data:{message:{...}}}`, `{payload:...}`, and stringified inner JSON; support batch arrays.
-- [x] Session sync: continue waiting on `sessionId` from SSE; accept bare lines with `sessionId=`.
-- [x] Timeouts: increase `initialize` await timeout to 20s.
-  - [x] Logging: add clear logs for extracted session endpoint and forwarded JSON-RPC objects.
-  - [x] Gateway alignment: handle lowercase `sessionid` and resolve endpoint event RequestURI `?sessionid=...` to `/sse?sessionid=...`.
-
-  - Listen for `notification` (e.g., `initialized`).
-- [x] HTTP/SSE path (Phase B): build a custom `StreamChannel<String>`:
-  - Stream: SSE incoming JSON lines/messages.
-  - Sink: HTTP POST to the discovered session endpoint (`/message` or `/sse?sessionid=...`).
-  - Wrap this channel with `json_rpc_2.Peer` for uniform handling.
- - [x] Reconnect/backoff: implemented WS exponential backoff reconnect in `lib/Services/mcp_service.dart` and SSE auto re-subscribe with exponential backoff in `lib/Services/http_sse_channel.dart`.
- - [x] Heartbeat: implemented periodic `$/ping` via `json_rpc_2.Peer` for WS in `McpService`; on timeout/error triggers reconnect.
-
-Immediate next actions
-- [x] Refactor `lib/Services/mcp_service.dart` WS transport to construct `Peer` and route `_rpc()` through it. (done)
-- [ ] Keep current HTTP/SSE implementation as-is temporarily; add the custom `StreamChannel` wrapper next.
-- [ ] Verify end-to-end: initialize → tools/list → tools/call over WS using `Peer`.
-- [ ] Then swap HTTP/SSE to `Peer` once the custom channel is in place.
-
-Immediate next steps
-- [x] Implement `StreamChannel<String>` wrapper for HTTP/SSE and wrap with `json_rpc_2.Peer` to unify transports.
-- [ ] Add reconnect/backoff and optional heartbeat for SSE + POST.
-- [ ] Reduce verbose logging in release builds; keep debug switches.
-- [ ] Add tests for SSE parsing and endpoint handling.
-
-### Progress Update — 2025-08-27 (Phase B alignment)
-
-- [x] Endpoint handling: prefer emitted `/message?sessionId=<id>`; fallback to canonical `{base}/sse?sessionid=<id>`; then `/message`, `/rpc`, base URL.
-- [x] Event-aware SSE parsing: track `event:` name; treat `endpoint` to set session, `message` for JSON-RPC, ignore others.
-- [x] Enhanced logging: print SSE event names, first 200 chars of payload, and ids/methods forwarded to client.
-- [ ] Build custom `StreamChannel<String>` for HTTP/SSE and wrap with `json_rpc_2.Peer`.
-
-### What worked — Gateway SSE integration
-
-- __LLM adherence to protocol__: It might not always emit perfect `TOOL_CALL:` JSON.
-  - Mitigate with clear prompt instructions and strict examples.
-  - Parser tolerates whitespace and buffers incomplete lines.
-- __Transport variability__: Some MCP servers require stdio.
-  - Start with WebSocket; add stdio in Production phases.
-- __Latency__: Tool calls can increase round-trip time.
-  - Show spinner; consider timeouts; allow cancel.
- - __Web constraints__: HTTPS + WSS required; no stdio; no port scanning. Document dev reverse-proxy with valid certs.
- - __Large tool outputs__: Truncate or summarize `TOOL_RESULT:` to avoid blowing model context; provide expandable UI later.
- - __Stream orchestration__: Risk of duplicate/interleaved tokens. Use explicit cancellation and state machine in `ChatProvider`; add tests.
-
-
-## MVP Implementation Stages and Actionable Steps
-
-### Progress Update — 2025-08-28
-
-- [x] Implemented `HttpSseStreamChannel` at `lib/Services/http_sse_channel.dart` bridging SSE (incoming) and POST (outgoing) under `StreamChannel<String>`.
-- [x] Wired HTTP/SSE transport through `json_rpc_2.Peer` in `lib/Services/mcp_service.dart` (`_connectHttp` now constructs `Peer` over `HttpSseStreamChannel`).
-- [x] Removed legacy manual HTTP routing and unused `_handleMessage()` now that both transports use Peer.
-- [x] Added dependency `stream_channel: ^2.1.2` and fetched deps.
-- [x] Resilience: WS heartbeat + reconnect with exponential backoff; SSE re-subscribe with backoff and lifecycle cleanup.
-- [x] Refactor: moved top-level heartbeat/reconnect helpers into `McpService` as private instance methods (`_startHeartbeat`, `_heartbeat`, `_scheduleWsReconnect`) to fix scope error (`_heartbeatTimers` undefined) and to access class state consistently.
-- [x] Analyzer cleanup: removed unused `_controller` parameter/field from `HttpMessageSink` and updated its construction in `HttpMessageChannel` to eliminate warnings.
-- [x] Analyzer cleanup: consolidated duplicate `flutter/foundation.dart` imports into a single selective import in `lib/Services/mcp_service_backup.dart` and `lib/Services/mcp_service_simplified.dart`.
-- [x] Analyzer cleanup: converted `print` to `debugPrint` in `diagnose_gateway.dart`.
-- [x] Analyzer cleanup: removed unnecessary cast in `_handleMessage()` in `lib/Services/mcp_service_backup.dart`.
-- [x] Docs: fixed dartdoc comments in `lib/Services/http_sse_channel.dart` to wrap generics/endpoints in code spans and avoid HTML rendering.
-- [ ] Widgets: started removing unused `super.key` from private widget constructors (`_ReinsLargeMainPage`, `_ChatConfigureBottomSheetContent`, `_RenameButton`, `_SaveAsNewModelButton`, `_DeleteButton`, `_BottomSheetTextField`). Continue scanning remaining widgets.
-- [ ] Logging hygiene (pending): gate verbose logs and scrub sensitive values.
+- __Hive Settings__ (`Hive.box('settings')`):
+  - `serverAddress` (existing for Ollama)
+  - `mcpServers` (new): A list of objects `{name, endpoint, authToken?}`.
+- No schema migration is required for settings; the app defaults to an empty list if the key is missing.
 
-### Analyzer cleanup (round 2)
 
-- [x] Widgets: removed unused `super.key` from private constructors in `lib/Pages/settings_page/subwidgets/server_settings.dart` (`_ConnectionStatusIndicator`, `_OllamaInfoBottomSheet`).
-- [x] Colors: replaced deprecated `Color.value` with `toARGB32()` in `lib/Utils/material_color_adapter.dart` (read/write and predicate).
-- [x] Tests: added dev dependencies `path_provider_platform_interface` and `plugin_platform_interface` in `pubspec.yaml` to satisfy test imports.
-- [~] Temporary: added `// ignore: deprecated_member_use` around `RadioListTile.groupValue/onChanged` in `lib/Widgets/selection_bottom_sheet.dart`. TODO: migrate to `RadioGroup` API when adopting Flutter 3.32+ patterns.
 
-## Cross-Platform Transport Support Plan
+#### Tool Call Utilities (`lib/Constants/tool_system_prompt.dart`, `lib/Utils/tool_call_parser.dart`)
 
-Based on `MCP-Transport-Platform-Compatibility.md`, ensure each platform uses fully compatible transports and configs.
+- Prompt appendix renders a concise list of tools and usage rules for structured and fallback modes.
+- Fallback parser utilities expose `kToolCallPrefix`, `kToolResultPrefix`, `parseToolCall(String)`, and `formatToolResult(...)`.
 
-- __Web (Flutter Web)__
-  - Implement native browser SSE using `dart:html` `EventSource` when `kIsWeb` is true. [t51, t59]
-  - Provide proxy/CORS configuration (proxy base URL), detect and log blocked requests. Docs in `.mcp-docs`. [t52, t58]
-  - Prefer SSE for Gateway; WebSocket for direct WS servers.
+### Key Implementation Files
 
-- __Android__
-  - Ensure `INTERNET` permission; add Debug Network Security Config for cleartext localhost during dev; document HTTPS for prod. [t53, t58]
-  - Use current HTTP/SSE and WebSocket; add reconnect with backoff. [t55, t56]
-  - Expose TLS options (pinning hooks). [t57]
+- __Orchestration__: `lib/Providers/chat_provider.dart`
+- __MCP Service__: `lib/Services/mcp_service.dart`
+- __Models__: `lib/Models/mcp.dart`, `lib/Models/ollama_message.dart`
+- __System Prompt__: `lib/Constants/tool_system_prompt.dart`
+  
 
-- __iOS__
-  - Add ATS exceptions for dev localhost; document HTTPS/cert pinning for prod. [t54, t58]
-  - Ensure URLSession-based SSE stays alive within background constraints; implement reconnect + backoff. [t55, t56]
-  - Expose TLS options (pinning hooks). [t57]
+### Platform Constraints
 
-- __Desktop (Windows/macOS/Linux)__
-  - Verify HTTP/SSE and WebSocket paths; add reconnect with exponential backoff. [t55, t56]
-  - Expose TLS options (pinning hooks). [t57]
+- __Web__: Browser environment lacks `dart:io` and `sqflite`. Use `kIsWeb` guards to disable DB/file operations; prefer Hive-only persistence on web. Require `wss://` when served over HTTPS to avoid mixed content. Consider native browser SSE via `dart:html` for Gateway paths.
+- __Mobile (iOS/Android)__: Network permissions required. Allow cleartext to `localhost` in dev (ATS/iOS, Network Security Config/Android). No stdio transport on iOS; limited on Android.
+- __Desktop (Windows/macOS/Linux)__: Most flexible; full WS/HTTP support and candidates for future stdio transport.
 
-- __Testing__
-  - Integration tests per platform where feasible to validate `initialize` and `tools/list` over WS and Gateway SSE. [t60]
+### Transport Details (WS + HTTP/SSE)
 
-Deliverables will include code changes, platform-specific setup docs, and logging improvements to diagnose transport issues across targets.
+- __WebSocket__: Wrap channel with `json_rpc_2.Peer`; support binary frames (UTF-8 decode) and heartbeat + reconnect with backoff.
+- __HTTP/SSE (Gateway)__: Use a custom `HttpSseStreamChannel` bridging SSE (incoming) and POST (outgoing), wrapped with `json_rpc_2.Peer`.
+- __Session discovery__: Prefer emitted `/message?sessionId=...`; fallback to `/sse?sessionid=...`, `/message`, `/rpc`, or base URL.
+- __Envelope tolerance__: Accept `{event,data}`, `{data:{message:{...}}}`, `{payload:...}`, and batch arrays.
+- __Diagnostics__: Log first-page keys, pages/cursors, totals per server; cache last error per server for Settings tooltip.
 
-### Stage 1 — MCP Service (wire transport)
+### Cross-Platform Transport Support Plan
 
-- [x] Implement connection manager and JSON-RPC request/response with ids.
-- [x] Cache `McpTool` list in memory.
-- [x] Implement `initialize`, `tools/list` (with pagination), and `tools/call` for each connected server. Handle binary WS frames.
+- __Web__: Prefer native browser SSE via `dart:html EventSource` for Gateway; ensure `wss://` under HTTPS; document proxy/CORS.
+- __Android/iOS__: INTERNET/ATS config for dev; maintain reconnect/backoff; expose TLS hooks.
+- __Desktop__: Full WS+SSE; candidates for future stdio transport; TLS hooks.
+- See `.mcp-docs/MCP-Transport-Platform-Compatibility.md` for details.
 
-### Stage 2 — Prompt Protocol & Parser integration
+### Risks and Mitigations
 
-- [x] Implement parser/formatter utilities for `TOOL_CALL:` and `TOOL_RESULT:`.
-- [x] Build system prompt appendix renderer from the cached tool list.
+- __LLM adherence__: Sentinel fallback can be brittle; mitigate with clear prompt appendix, examples, tolerant parsing, and prefer structured tools when available.
+- __Latency__: Tool calls add round trips; show spinner/"Thinking" UI; support cancellation and reasonable timeouts.
+- __Large outputs__: Truncate/summarize tool results before injection; allow expand-on-demand UI later.
+- __Transport variability__: Some servers require stdio; start with WS/SSE; plan stdio on desktop in production.
+- __Web constraints__: HTTPS + WSS requirement and CORS; document reverse proxy; avoid port scanning; use `dart:html` EventSource for SSE.
+- __Stream orchestration risk__: Duplicate/interleaved tokens; always cancel before restart; use guard flags and tests.
 
-### Stage 3 — ChatProvider Integration
-- [x] Inject prompt appendix at send time (do not permanently mutate DB-stored prompt).
-- [x] Intercept tool calls mid-stream; cancel current stream; perform MCP call; inject result; resume model generation with a new stream.
-- [x] Handle errors by returning a `TOOL_RESULT` with an `error` field.
- - [x] Add guard flags and ensure `_activeChatStreams` is cleared before resuming.
+---
 
-### Stage 4 — Settings Wiring (MVP minimal)
-- [x] Persist `mcpServers` to Hive; seed with empty list (works cross-platform). Save triggers disconnectAll -> connectAll -> listTools warmup.
-- [x] In `main.dart`, create `McpService`, read configs, `connectAll`, `listTools`.
- - [ ] Auto-discovery UI: desktop/mobile only. Not feasible on web due to browser restrictions.
- - [ ] Per-chat toggles to enable/disable discovered servers/tools for a given chat.
- - [ ] Configure Chat popup: allow selecting tools based on tools available at specified addresses.
- - [ ] Agent Profile Config page (JSON): basic page to define tool selections via JSON (scaffold; profiles selectable UX comes later).
+## 4. Milestones and Success Criteria
 
-### Stage 5 — Tests (MVP)
-- [ ] Unit tests for `tool_call_parser.dart`.
-- [ ] Unit tests for `mcp_service.dart` (mock WebSocket) covering list/call and error paths.
-- [ ] Provider test: simulate a tool call streamed from the model and verify orchestration.
+- __MVP Complete__: Model can request a tool from a connected MCP server; Reins executes it; model uses the result to produce a final answer.
+- __Production Ready__: Stable tool loop with clear UI, tests, error handling, and multiple transports supported.
 
+## 4.1 MVP Implementation Stages (Condensed)
 
-## MVP: File-by-File Implementation Plan (lib/)
+- __Stage 0 — Scaffolding__: Models, service, parser, prompt appendix.
+- __Stage 1 — MCP Service__: `initialize`, `tools/list`, `tools/call` over WS+SSE via `json_rpc_2.Peer`; reconnect/heartbeat.
+- __Stage 2 — Prompt & Parser__: Tool appendix; sentinel parser/formatter (fallback path).
+- __Stage 3 — Chat Orchestration__: Intercept → cancel → MCP call → inject result → restart generation (recursive dispatch).
+- __Stage 4 — Settings__: Hive persistence for `mcpServers`; minimal UI; last-error tooltip.
+- __Stage 5 — Tests__: Service, parser (fallback), provider orchestration, and SSE parsing basics.
 
-### Stage 0 — Scaffolding (create new files)
+## 4.2 MVP: File-by-File Plan (lib/)
 
-- [x] __Create__ `lib/Services/mcp_service.dart`
-  - Implemented interface and transports: WebSocket + HTTP/SSE (Gateway).
-  - Exposes: `connectAll(List<McpServerConfig>)`, `connectionStates()`, `listTools({server})`, `call(server, tool, args)`.
-  - WebSocket path wrapped with `json_rpc_2.Peer`; HTTP/SSE uses custom channel and sink.
+- __Create__ `lib/Services/mcp_service.dart` and `lib/Models/mcp.dart` (done); unify WS+SSE via `json_rpc_2.Peer`.
+- __Create__ `lib/Services/http_sse_channel.dart` for Gateway SSE path.
+- __Create__ `lib/Constants/tool_system_prompt.dart`; __(fallback)__ `lib/Utils/tool_call_parser.dart`.
+- __Edit__ `lib/main.dart`: provide `McpService`, read `mcpServers`, `connectAll` then warm `listTools`.
+- __Edit__ `lib/Providers/chat_provider.dart`: inject prompt appendix; structured tools primary; sentinel fallback.
+- __Edit__ Settings subwidgets: list/edit servers; show connection state and last error.
 
-- [x] __Create__ `lib/Models/mcp.dart`
-  - `McpServerConfig { name, endpoint, authToken? }`
-  - `McpTool { server, name, description?, inputSchema? }`
-  - `McpToolCall { server, name, args }`
-  - `McpToolResult { result, error? }`
+## 5. Archive
 
-- [x] __Create__ `lib/Utils/tool_call_parser.dart`
-  - `parseToolCall(String)` detects `TOOL_CALL:` line, parses JSON -> `McpToolCall?`.
-  - `formatToolResult(String toolName, dynamic result, {String? error})`.
-
-- [x] __Create__ `lib/Constants/tool_system_prompt.dart`
-  - `String toolSystemPrompt(List<McpTool> tools)` to render tool list + exact sentinel usage instructions.
+<details>
+<summary>Progress Update — 2025-08-28 (Architectural Refactor: Structured Tool-Calls)</summary>
 
-- __Feasibility__: Straightforward scaffolding; no platform constraints. Pure Dart data/models and helpers.
-  - __Note__: Add `web_socket_channel` to `pubspec.yaml`. Consider `flutter_secure_storage` later for tokens (Production).
+- **Objective**: Replace the brittle text-based tool-call protocol (`TOOL_CALL:`/`TOOL_RESULT:`) with a structured JSON protocol natively supported by newer Ollama models.
+- **`OllamaMessage` & `McpToolCall` Models**:
+  - Updated `McpToolCall` to include an `id` field and a `function` object wrapper (`{name, arguments}`) to match the Ollama API schema.
+  - Modified `McpToolCall.fromJson` to be backward-compatible, handling both the new structured format and the old sentinel format during the transition.
+  - Enhanced `OllamaMessage` to deserialize the `tool_calls` array from the API response into an `McpToolCall` object.
+  - Updated `OllamaMessage.toChatJson` to serialize `tool_results` into the format expected by the Ollama API, including the tool call `id`.
+- **`ChatProvider` Refactor**:
+  - Removed all dependencies on `tool_call_parser.dart`.
+  - Replaced text sentinel detection with structured `message.toolCall != null` checks.
+  - Adopted a recursive dispatch loop: finish a generation, process tool calls, append results, then start a new generation.
+- **`OllamaService` Enhancements**:
+  - Added a `supportsTools` flag to the `chatStream` method.
+  - When `supportsTools` is true, the service now includes a `"tools": [...]` array in the `/api/chat` request payload, signaling structured tool support to the model.
+  - Implemented `getModel()` to fetch a single model's capabilities.
+- **System Prompt & Testing**:
+  - Simplified `generateToolSystemPrompt` to produce a clean JSON description of available tools for models that support the new protocol.
+  - Deleted the obsolete `tool_call_parser.dart` and its associated test file.
+  - Rewrote `chat_provider_tool_flow_test.dart` to validate the new end-to-end flow using structured `McpToolCall` and `McpToolResult` objects instead of string parsing.
 
-### Stage 1 — MCP Service (wire transport)
-
-- [x] __Edit__ `lib/Services/mcp_service.dart`
-  - Implemented WebSocket client (via `web_socket_channel`) and HTTP/SSE channel.
-  - WebSocket path uses `json_rpc_2.Peer` for ids, requests, notifications, and errors.
-  - Methods: `initialize`, `tools/list`, `tools/call`, with id routing and error mapping.
+</details>
 
-- [x] __Edit__ `lib/main.dart`
-  - Provides `McpService` in `MultiProvider` and wires startup to read `mcpServers` from Hive and `connectAll` then warm `listTools`.
+<details>
+<summary>Progress Update — 2025-08-28 (Streaming Lifecycle Fix & Stability)</summary>
 
-- __Feasibility__: High. WS and HTTP/SSE confirmed working against Gateway; add reconnect/backoff next.
+- Fixed a critical issue where the second generation after a tool call was misinterpreted as cancelled. We now re-enable the thinking indicator at the start of each iteration in `ChatProvider._streamOllamaMessage()`.
+- Added `_supportsToolsCache` to avoid repeated `getModel()` calls inside the tool loop.
+- Introduced `_cancelledChatIds` to explicitly mark stream cancellations, reducing race conditions and improving reliability.
+- Updated tests to ensure deterministic tool-call streaming in fakes and aligned DB naming (`ollama_chat.db`).
 
-### Stage 2 — Prompt Protocol & Parser integration
-
-- [x] __Edit__ `lib/Constants/tool_system_prompt.dart`
-  - Implemented prompt appendix including strict format for `TOOL_CALL:` and example JSON.
+</details>
 
-- [x] __Edit__ `lib/Providers/chat_provider.dart`
-  - Injects tool appendix at send time (do not mutate DB-stored prompt).
-  - Detects `TOOL_CALL:` mid-stream using `parseToolCall`; cancels, calls MCP, injects `TOOL_RESULT:`, resumes stream.
-
-- __Feasibility__: High. Completed and verified in app flows.
-
-### Stage 3 — ChatProvider Orchestration
-
-- [x] __Edit__ `lib/Providers/chat_provider.dart`
-  - On detecting a `McpToolCall`, pause streaming, call MCP, inject `TOOL_RESULT:`, then resume generation with updated transcript. Guard flags added.
-
-- __Feasibility__: Completed. Provider integration working; tests pending.
-
-### Stage 4 — Settings Wiring (Servers + Discovery)
-
-- [x] __Edit__ `lib/Pages/settings_page/subwidgets/mcp_settings.dart`
-  - Added MCP Servers section with fields: Name, Endpoint, optional Auth Token.
-  - Persists to Hive `settings['mcpServers']` as a list of `{ name, endpoint, authToken? }`.
-  - On Save: triggers `disconnectAll → connectAll → listTools` warmup.
-  - Shows per-row connection status chip using `McpService.connectionStates()`.
-  - Shows live tools count and a "View" dialog pulling from `McpService.getTools(serverUrl)`.
-
-- [x] __Edit__ `lib/main.dart`
-  - Reads `mcpServers` on startup, constructs `McpServerConfig`, wires `connectAll` and tools warmup.
+---
 
-- [ ] Auto-discovery UI: desktop/mobile only. Not feasible on Web due to browser restrictions.
-- [ ] Per-chat toggles to enable/disable servers/tools for a given chat.
-- [ ] Configure Chat popup: allow selecting tools based on available addresses.
-- [ ] Agent Profile Config page (JSON): define tool selections via JSON (profiles selectable UX later).
+## 6. Appendix — Notes merged from backup
 
-- __Edit__ `lib/main.dart`
-  - After Hive open, ensure `settings.putIfAbsent('mcpServers', () => <Map<String, dynamic>>[])`.
-  - On provider creation, read configs and invoke `connectAll`, then optionally `listTools` to warm cache.
+- __Files changed (Stage 2)__
+  - `lib/Providers/chat_provider.dart`: `fetchAvailableModels()` now calls `listModelsWithCaps()`.
+  - `lib/Widgets/selection_bottom_sheet.dart`: added `itemBuilder`, `valueSelector`, `currentSelectionValue`; selection returns `Future<T?>`.
+  - `lib/Widgets/chat_app_bar.dart`: model picker shows `OllamaModel` list with a “Tools” Chip when `supportsTools` is true.
 
-- __Feasibility__: High. Settings UI and Hive persistence already exist for Ollama server. Adding a parallel section for MCP servers is routine. Network scan is best-effort and may be desktop/mobile only (skip on Web or restrict to user-provided endpoints).
-  - __Notes__: For web, only allow manual WSS endpoints; document mixed content constraints.
+- __Optional tracks & web compatibility__
+  - Add `kIsWeb` guards and prefer Hive-only persistence on web; document `wss://` with HTTPS.
+  - Consider native browser SSE (`dart:html`) for Gateway.
 
-### Stage 5 — Tests
+- __Testing progress (t73)__
+  - In-memory `json_rpc_2.Peer` seam for `McpService` tests.
+  - Basic unit tests for MCP list/call flows and parser (historical, now replaced by structured path).
 
-## Implementation-First Next Steps (skip tests for now)
+<details>
+<summary>Expand to see archived progress logs</summary>
 
-- [ ] __Unify HTTP/SSE with json_rpc_2 via Peer__
-  - [ ] Create `lib/Services/http_sse_channel.dart`
-    - Defines `HttpSseStreamChannel` that implements `StreamChannel<String>` bridging:
-      - Incoming: SSE lines → framed messages → sink.add(String) to `Peer`.
-      - Outgoing: `add(String json)` → POST to preferred session endpoint with redirect handling.
-      - Re-subscribe on SSE disconnect with exponential backoff.
-  - [ ] __Edit__ `lib/Services/mcp_service.dart`
-    - Replace custom HTTP/SSE request routing with `json_rpc_2.Peer` over `HttpSseStreamChannel`.
-    - Keep WS path unchanged; both transports use a unified `_sendRequestViaPeer()`.
-    - Gate verbose SSE logs behind a debug flag.
+### UI Polish & Spinner/Cancel Implementation (Completed 2025-08-28)
 
-- [ ] __Resilience: reconnect + heartbeat__
-  - [ ] __Edit__ `lib/Services/mcp_service.dart`
-    - WS: exponential backoff reconnect; optional `$/ping` or benign request every 30s; drop and reconnect on timeout.
-    - SSE: backoff for subscribe; POST watchdog with timeout and retry.
-    - Expose connection health in `connectionStates()` with reason codes.
+- __Logging Hygiene__: Wrapped all `debugPrint` calls in `mcp_service.dart` with `kDebugMode` checks to ensure verbose logs are stripped from release builds.
+- __MCP Settings UI Polish__: Implemented live URI validation for server endpoints, added tooltips for connection error statuses, included a confirmation dialog before server deletion, and made the "Save & Reconnect" button state-aware (disabled on error or no changes).
+- __Spinner & Cancellation__: Enhanced the `ToolCallMessage` widget to display a `CircularProgressIndicator` during execution and a "Cancel" button. Updated `ChatProvider` to handle cancellation requests, mark the corresponding tool call message as cancelled, and prevent the result from being processed.
 
-- [ ] __Settings UX enhancements__
-  - [ ] __Edit__ `lib/Pages/settings_page/subwidgets/mcp_settings.dart`
-    - Add Auto-discovery (desktop/mobile): simple host:port scan dialog; populate candidates list with toggles.
-    - Add per-chat enablement toggle stencil in row UI (stored globally for now; wires per-chat later).
-  - [ ] __Create__ `lib/Pages/chat_page/subwidgets/configure_chat_tools_dialog.dart`
-    - Modal to select tools per chat from available servers; persists minimal selection on chat metadata.
-  - [ ] __Create__ `lib/Models/agent_profile.dart` and __Edit__ `lib/Pages/settings_page/agent_profiles.dart`
-    - JSON-backed profile scaffold: name + selected servers/tools; selectable later in UX polish.
 
-- [ ] __Logging hygiene__
-  - [ ] __Edit__ `lib/Services/mcp_service.dart`
-    - Introduce `bool mcpDebugLogs` (in settings or const) to reduce logs in release.
-    - Scrub auth tokens and querystrings containing secrets from logs.
+### MVP Stages Summary (Completed)
 
-- [ ] __Docs upkeep__
-  - [ ] __Edit__ `/.mcp-docs/mcp-gateway-contract.md`
-    - Keep endpoint preference notes updated if gateway variants change.
-  - [ ] __Edit__ `/.mcp-docs/mcp-client-plan.md`
-    - Mark each subtask above as completed as we land code.
+- __Stage 0 — Scaffolding__: Models, service stubs, parser, prompt appendix.
+- __Stage 1 — MCP Service__: `initialize`, `tools/list`, `tools/call` over WS+SSE, with reconnect/heartbeat.
+- __Stage 2 — Prompt & Parser__: `TOOL_CALL` / `TOOL_RESULT` parser and prompt injection.
+- __Stage 3 — Chat Orchestration__: Stream intercept, cancel, call, and resume logic.
+- __Stage 4 — Settings__: Minimal UI and Hive persistence for MCP servers.
+- __Stage 5 — Tests__: Unit tests for parser and mock service behavior completed.
 
-## Production Implementation Stages and Steps
+### Detailed Development Logs
 
-### Stage P1 — UI/UX Polish
-- [ ] Distinct visual treatment for tool calls/results (cards, icons, monospace, collapsible).
-- [ ] Inline spinner while executing; allow cancel.
- - [ ] Agent Profiles: preconfigured tool selections/custom sets that can be selected per chat.
- - [ ] Tasks page: agent automations with preselected profile and prompts (create/run/schedule tasks).
+#### Data Model & "Thinking" UI (Completed 2025-08-28)
 
-__Feasibility notes__
-- High. Pure Flutter UI changes; no platform blockers. Agent Profiles need a small config schema and per-chat persistence.
+- __Data Model__: Enhanced `OllamaMessage` to include optional `McpToolCall` and `McpToolResult` fields. This moves the system away from brittle string parsing and toward a more robust, structured data approach.
+- __"Thinking" UI__: Implemented a new `ToolCallMessage` widget that renders a special "Thinking" state when a tool call is initiated. `ChatProvider` was updated to create a message with a `tool` role, which is then updated with the result upon completion. This provides users with clear feedback and visibility into the tool execution process.
 
-### Stage P2 — Roles and Structure
-- [ ] Add `tool` role to `OllamaMessage` (new enum value) and support in DB mapping.
+#### Testing Progress (t73)
 
-__Feasibility notes__
-- Medium. Touches models, DB migrations, and rendering. Backward compatibility required for stored transcripts.
-- [ ] Display tool messages differently and exclude them from user-visible text if desired.
- - __DB migration__: Extend role enum or remove CHECK; provide `onUpgrade` path and data backfill where necessary.
+- Added a test seam to `McpService`: `attachPeerAndInitialize(serverUrl, rpc.Peer)` marked `@visibleForTesting` to attach an in-memory `json_rpc_2.Peer` and run `initialize` + `tools/list` without real network.
+- Introduced `DummyMessageChannel` to satisfy internal channel checks during tests.
+- Created unit tests for `tool_call_parser.dart` and `mcp_service_test.dart` using `StreamChannelController<String>` + `json_rpc_2.Server` to simulate `initialize`, `tools/list`, `tools/call` (echo) and validate service behaviors.
+- Added `meta` dependency for `@visibleForTesting`.
 
-### Stage P3 — Transport & Auth
-- [ ] Add stdio transport for local MCP servers (desktop first).
-- [ ] Add per-server auth (headers/tokens) and secure storage.
- - [ ] OAuth and other authentication flows for authenticated MCP servers (e.g., Zapier, Google); token storage/refresh.
- - [ ] Remote access helpers: Tailscale/MagicDNS support for remote local-network access.
- - [ ] Ability to launch/manage selected MCP servers locally at runtime (desktop-first), similar to advanced IDE clients.
- - __Notes__: Stdio is desktop-first. Use `flutter_secure_storage` for tokens on mobile/desktop; web requires alternative storage strategy.
 
-### Stage P4 — Schema & Validation
-- [ ] Validate tool args against JSON Schema; show UI form for argument building (optional).
-- [ ] Pre-exec confirmation for sensitive tools.
+#### Progress Update — 2025-08-28 (Transport & Resilience)
 
-### Stage P5 — Observability
-- [ ] Add structured logging and diagnostics view.
- - [ ] Status page or overlay to visualize connection status/health for each MCP server and tool (latency, last error).
+- Implemented `HttpSseStreamChannel` at `lib/Services/http_sse_channel.dart` bridging SSE (incoming) and POST (outgoing) under `StreamChannel<String>`.
+- Wired both WebSocket and HTTP/SSE transports through `json_rpc_2.Peer` for consistent RPC handling.
+- Added resilience features: WebSocket heartbeat with reconnect on timeout, and exponential backoff for both WS and SSE connections.
+- Refactored heartbeat/reconnect helpers into `McpService` as private instance methods to fix scope errors and access class state consistently.
+- Performed extensive analyzer cleanup, removing unused code, redundant imports, and improving documentation.
 
-### Stage P6 — Reliability
-- [ ] Add retries/backoff; circuit breakers; per-call timeouts and budgets.
+#### Progress Update — 2025-08-27 (Transport Unification & SSE Enhancements)
 
-### Stage P7 — Testing & QA
-- [ ] Integration tests across transports and multiple servers.
-- [ ] Snapshot tests for tool UI; performance tests for large tool outputs.
+- Unified WebSocket and HTTP/SSE transports to use `json_rpc_2.Peer`, simplifying the `McpService` logic.
+- Improved SSE event framing to correctly handle multi-line `data:` chunks and various JSON envelope formats.
+- Enhanced logging for SSE session extraction and JSON-RPC diagnostics.
+- Aligned with gateway contracts by handling lowercase `sessionid` and resolving `RequestURI` correctly.
 
-## Roadmap: Mid-term and Long-term Goals
-
-### Near-term (MVP)
-
-- __Auto-discovery & zero manual config__
-  - UI to scan one or more user-provided hosts for MCP servers and present a selectable list.
-  - Per-chat toggles to enable/disable discovered servers/tools.
-   - __Platform note__: Not supported on web; desktop/mobile only.
-
-- __Agent Profile Config Page via JSON__
-  - Dedicated page to configure tools per agent profile using JSON (with validation and examples).
-
-- __Configure Chat panel integration__
-  - Extend the existing "Configure the Chat" popup to select tools based on the tools available at specified addresses.
-
-### Mid-term
-
-- __Agent Profiles__
-  - Preconfigured tool selections and behaviors that can be chosen per chat.
-  - Support custom profiles created by users.
-
-- __Tasks Page__
-  - Agent automations with preselected profiles and prompts; runnable and schedulable tasks.
-
-### Long-term
-
-- __Authenticated MCP servers__
-  - OAuth and other authentication flows for providers such as Zapier or Google.
-  - Token storage and refresh handling.
-
-- __Status Page/Overlay__
-  - Visualize connection status/health for each MCP server and tool; include last error and latency.
-
-- __Remote network access helpers__
-  - Integration or automatic support for Tailscale for remote local-network access when not covered by MagicDNS.
-
-- __Run local MCP servers at runtime__
-  - Ability to launch/manage selected MCP servers locally from the client (desktop first), similar to advanced IDE clients.
-
-## Milestones and Success Criteria
-
-- __MVP Complete__: Model can request at least one tool from a connected MCP server; Reins executes it and the model uses the result to produce a final answer.
-- __Production Ready__: Stable tool loop with clear UI, tests in place, error handling, and support for multiple transports.
-
-## Immediate Next Actions (Week 1)
-
-1) Stage 0: Scaffold files and add dependency `web_socket_channel`.
-2) Stage 1: Implement `McpService` (connect/list/call) against a local WebSocket-based MCP server.
-3) Stage 2: Implement `tool_call_parser` and `tool_system_prompt` with 1–2 tool examples.
-4) Stage 3: Minimal changes in `ChatProvider` to intercept `TOOL_CALL:` and resume with `TOOL_RESULT:`.
-
-### Next Steps (short)
-- Ensure the Docker MCP Gateway is running with `--transport streaming` at `http://localhost:7999`.
-- Reconnect and check logs for `MCP HTTP(streaming) connect ->`, `MCP initialize OK`, and `MCP tools/list` totals.
-- If no initialize logs appear, perform a full app restart (not hot reload).
-- Wire Settings UI tooltip to show `McpService.getLastError(serverUrl)` for quick diagnosis.
-- If tools remain empty, verify whether the gateway requires a server selector param in `tools/list`; add if necessary.
-
-### Optional track: Web Compatibility
-- Add `kIsWeb` guards and conditional imports to files that use `dart:io` (`main.dart`, `database_service.dart`, `ollama_message.dart`).
-  - Implemented: guarded `Platform` checks in `lib/main.dart`; disabled PathManager initialization on web; disabled local-network search button on web.
-- Swap/guard `sqflite` for a web-compatible persistence (e.g., Hive-only for chats) on web builds.
-  - Implemented: guarded all `DatabaseService` calls in `lib/Providers/chat_provider.dart`; chats/messages stored in-memory on web for now.
-  - Implemented: guarded `deleteMessage()` path too, preventing web-side deletes.
-- Replace `File` handling with `XFile`/`Uint8List` abstractions on web.
-  - Implemented partial: attachments flow disabled on web with snackbar notice in `lib/Pages/chat_page/chat_page.dart`.
-  - Implemented: guarded all file/path access in `lib/Models/ollama_message.dart` (base64 encode, construct paths, relative paths) using `kIsWeb`.
-- Ensure `wss://` endpoints when served over HTTPS; document local dev reverse proxy.
-  - TODO: verify/document wss configuration and reverse proxy for web.
-
-Additional fixes:
-- Guarded `PathManager.initialize()` against Web (`lib/Constants/path_manager.dart`) to avoid `getApplicationDocumentsDirectory` on Web.
-- Removed `dart:io Platform` usage in settings page (`lib/Pages/settings_page/subwidgets/reins_settings.dart`) with `kIsWeb` and `defaultTargetPlatform`.
-
-## References
-
-- Key code paths:
-  - `ChatProvider._streamOllamaMessage()` in `lib/Providers/chat_provider.dart`
-  - `OllamaService.chatStream()` in `lib/Services/ollama_service.dart`
-- Settings storage: `Hive.box('settings')` in `lib/main.dart`
+</details>

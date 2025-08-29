@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:reins/Constants/constants.dart';
+import 'package:reins/Models/mcp.dart';
 import 'package:reins/Models/ollama_chat.dart';
 import 'package:reins/Models/ollama_message.dart';
 import 'package:reins/Services/database_service.dart';
@@ -31,6 +32,108 @@ void main() async {
 
   test("Test database open", () async {
     await service.open('test_database.db');
+  });
+
+  test('Persist cancelled tool call result', () async {
+    final chat = await service.createChat(model);
+    final toolCall = McpToolCall(
+      id: 'call-2',
+      server: 'dummy',
+      name: 'echo',
+      args: {'text': 'bye'},
+    );
+
+    final toolMessage = OllamaMessage(
+      '',
+      role: OllamaMessageRole.tool,
+      toolCall: toolCall,
+    );
+    await service.addMessage(toolMessage, chat: chat);
+
+    final cancelled = McpToolResult(result: null, error: 'Cancelled');
+    toolMessage.toolResult = cancelled;
+    toolMessage.content = 'Tool call cancelled by user.';
+    await service.updateMessage(
+      toolMessage,
+      newContent: toolMessage.content,
+      newToolResult: cancelled,
+    );
+
+    final retrieved = await service.getMessage(toolMessage.id);
+    expect(retrieved, isNotNull);
+    expect(retrieved!.role, OllamaMessageRole.tool);
+    expect(retrieved.toolResult, isNotNull);
+    expect(retrieved.toolResult!.error, 'Cancelled');
+  });
+
+  test('Persist error tool call result', () async {
+    final chat = await service.createChat(model);
+    final toolCall = McpToolCall(
+      id: 'call-3',
+      server: 'dummy',
+      name: 'explode',
+      args: {'text': 'boom'},
+    );
+
+    final toolMessage = OllamaMessage(
+      '',
+      role: OllamaMessageRole.tool,
+      toolCall: toolCall,
+    );
+    await service.addMessage(toolMessage, chat: chat);
+
+    final errorRes = McpToolResult(result: null, error: 'Some error');
+    toolMessage.toolResult = errorRes;
+    toolMessage.content = 'Tool returned: Some error';
+    await service.updateMessage(
+      toolMessage,
+      newContent: toolMessage.content,
+      newToolResult: errorRes,
+    );
+
+    final retrieved = await service.getMessage(toolMessage.id);
+    expect(retrieved, isNotNull);
+    expect(retrieved!.role, OllamaMessageRole.tool);
+    expect(retrieved.toolResult, isNotNull);
+    expect(retrieved.toolResult!.error, 'Some error');
+  });
+
+  test('Persist and load tool role with tool_call and tool_result', () async {
+    final chat = await service.createChat(model);
+    final toolCall = McpToolCall(
+      id: 'call-1',
+      server: 'dummy',
+      name: 'echo',
+      args: {'text': 'hello'},
+    );
+
+    // Create tool message with call
+    final toolMessage = OllamaMessage(
+      '',
+      role: OllamaMessageRole.tool,
+      toolCall: toolCall,
+    );
+
+    await service.addMessage(toolMessage, chat: chat);
+
+    // Update with a result
+    final result = McpToolResult(result: {'ok': true, 'echo': 'hello'});
+    toolMessage.toolResult = result;
+    toolMessage.content = 'Tool returned: {ok: true, echo: hello}';
+    await service.updateMessage(
+      toolMessage,
+      newContent: toolMessage.content,
+      newToolResult: result,
+    );
+
+    final retrieved = await service.getMessage(toolMessage.id);
+    expect(retrieved, isNotNull);
+    expect(retrieved!.role, OllamaMessageRole.tool);
+    expect(retrieved.toolCall, isNotNull);
+    expect(retrieved.toolCall!.name, 'echo');
+    expect(retrieved.toolResult, isNotNull);
+    expect(retrieved.toolResult!.result, isNotNull);
+    expect((retrieved.toolResult!.result as Map)['ok'], true);
   });
 
   test("Test database create chat", () async {

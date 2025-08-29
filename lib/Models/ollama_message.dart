@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 
 import 'package:path/path.dart' as path;
 import 'package:reins/Constants/constants.dart';
+import 'package:reins/Models/mcp.dart';
 import 'package:uuid/uuid.dart';
 
 class OllamaMessage {
@@ -36,6 +37,9 @@ class OllamaMessage {
   int? evalCount;
   int? evalDuration;
 
+  McpToolCall? toolCall;
+  McpToolResult? toolResult;
+
   OllamaMessage(
     this.content, {
     String? id,
@@ -52,32 +56,41 @@ class OllamaMessage {
     this.promptEvalDuration,
     this.evalCount,
     this.evalDuration,
+    this.toolCall,
+    this.toolResult,
   })  : id = id ?? Uuid().v4(),
         createdAt = createdAt ?? DateTime.now();
 
-  factory OllamaMessage.fromJson(Map<String, dynamic> json) => OllamaMessage(
-        json["message"] != null
-            ? json["message"]["content"] // For chat messages
-            : json["response"], // For generated messages
-        role: json["message"] != null
-            ? OllamaMessageRole.fromString(json["message"]["role"])
-            : OllamaMessageRole.assistant, // For generated messages (default)
-        images: null, // TODO: Implement image support
-        createdAt: DateTime.parse(json["created_at"]),
-        model: json["model"],
-        // Metadata fields
-        done: json["done"],
-        doneReason: json["done_reason"],
-        context: json["context"] != null
-            ? List<int>.from(json["context"].map((x) => x))
-            : null,
-        totalDuration: json["total_duration"],
-        loadDuration: json["load_duration"],
-        promptEvalCount: json["prompt_eval_count"],
-        promptEvalDuration: json["prompt_eval_duration"],
-        evalCount: json["eval_count"],
-        evalDuration: json["eval_duration"],
-      );
+  factory OllamaMessage.fromJson(Map<String, dynamic> json) {
+    final messageJson = json['message'] as Map<String, dynamic>?;
+    final toolCalls = messageJson?['tool_calls'] as List?;
+
+    return OllamaMessage(
+      messageJson?['content'] ?? json['response'] ?? '',
+      role: messageJson != null
+          ? OllamaMessageRole.fromString(messageJson['role'])
+          : OllamaMessageRole.assistant,
+      images: null, // TODO: Implement image support
+      createdAt: DateTime.parse(json['created_at']),
+      model: json['model'],
+      // Metadata fields
+      done: json['done'],
+      doneReason: json['done_reason'],
+      context: json['context'] != null
+          ? List<int>.from(json['context'].map((x) => x))
+          : null,
+      totalDuration: json['total_duration'],
+      loadDuration: json['load_duration'],
+      promptEvalCount: json['prompt_eval_count'],
+      promptEvalDuration: json['prompt_eval_duration'],
+      evalCount: json['eval_count'],
+      evalDuration: json['eval_duration'],
+      // Take the first tool call if it exists
+      toolCall: toolCalls != null && toolCalls.isNotEmpty
+          ? McpToolCall.fromJson(toolCalls.first)
+          : null,
+    );
+  }
 
   factory OllamaMessage.fromDatabase(Map<String, dynamic> map) {
     return OllamaMessage(
@@ -87,6 +100,12 @@ class OllamaMessage {
       images: _constructImages(map['images']),
       createdAt: DateTime.fromMillisecondsSinceEpoch(map['timestamp']),
       model: map['model'],
+      toolCall: map['tool_call'] != null
+          ? McpToolCall.fromJson(jsonDecode(map['tool_call']))
+          : null,
+      toolResult: map['tool_result'] != null
+          ? McpToolResult.fromJson(jsonDecode(map['tool_result']))
+          : null,
     );
   }
 
@@ -110,11 +129,30 @@ class OllamaMessage {
         "eval_duration": evalDuration,
       };
 
-  Future<Map<String, dynamic>> toChatJson() async => {
-        "role": role.toCaseString(),
-        "content": content,
-        "images": await _base64EncodeImages(),
-      };
+  Future<Map<String, dynamic>> toChatJson() async {
+    final json = <String, dynamic>{
+      'role': role.toCaseString(),
+      'content': content,
+      'images': await _base64EncodeImages(),
+    };
+
+    if (toolCall != null) {
+      json['tool_calls'] = [toolCall!.toJson()];
+    }
+
+    if (toolResult != null) {
+      // This is a simplification. Ollama expects a list of tool results,
+      // each with a tool_call_id. For now, we assume a single tool flow.
+      json['tool_results'] = [
+        {
+          'tool_call_id': toolCall?.id ?? '', // Best effort
+          'result': toolResult!.toJson(),
+        }
+      ];
+    }
+
+    return json;
+  }
 
   Map<String, dynamic> toDatabaseMap() => {
         'message_id': id,
@@ -122,6 +160,8 @@ class OllamaMessage {
         'images': _breakImages(images),
         'role': role.toCaseString(),
         'timestamp': createdAt.millisecondsSinceEpoch,
+        'tool_call': toolCall != null ? jsonEncode(toolCall!.toJson()) : null,
+        'tool_result': toolResult != null ? jsonEncode(toolResult!.toJson()) : null,
       };
 
   void updateMetadataFrom(OllamaMessage message) {

@@ -258,7 +258,7 @@ class _ChatPageState extends State<ChatPage> {
     final selectedModel = await showSelectionBottomSheet(
       key: ValueKey(Hive.box('settings').get('serverAddress')),
       context: context,
-      header: OllamaBottomSheetHeader(title: "Select a LLM Model"),
+      header: OllamaBottomSheetHeader(title: "Select an Ollama LLM Model"),
       fetchItems: chatProvider.fetchAvailableModels,
       currentSelection: _selectedModel,
     );

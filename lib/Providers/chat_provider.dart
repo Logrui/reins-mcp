@@ -1,5 +1,4 @@
 import 'dart:io';
-
 import 'package:reins/Constants/constants.dart';
 import 'package:reins/Models/chat_configure_arguments.dart';
 import 'package:reins/Models/ollama_chat.dart';
@@ -10,10 +9,10 @@ import 'package:reins/Services/database_service.dart';
 import 'package:reins/Services/mcp_service.dart';
 import 'package:reins/Services/ollama_service.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
+import 'package:meta/meta.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:reins/Models/mcp.dart';
-import 'package:reins/Utils/tool_call_parser.dart';
 import 'package:reins/Constants/tool_system_prompt.dart';
 
 class ChatProvider extends ChangeNotifier {
@@ -36,15 +35,38 @@ class ChatProvider extends ChangeNotifier {
       _currentChatIndex == -1 ? null : _chats[_currentChatIndex];
 
   final Map<String, OllamaMessage?> _activeChatStreams = {};
-  bool _toolFlowActive = false; // guard to prevent re-entrant tool flows
+  final Map<String, bool> _activeToolCalls = {}; // message.id -> isRunning
+  static const int _maxToolCallsPerTurn = 5; // Safeguard against infinite loops
+  /// Cache of model -> supportsTools to avoid repeated capability lookups
+  /// within a single session. This is populated on first use in
+  /// `_streamOllamaMessage()` and reused for subsequent turns. If a chat's
+  /// model changes, the cache key naturally changes (by model name), so no
+  /// explicit invalidation is required here.
+  final Map<String, bool> _supportsToolsCache = {};
+
+  /// Explicit cancellation flags per chat, set when the user cancels a stream.
+  /// Using a dedicated flag is more robust than inferring cancellation from
+  /// the absence of an entry in `_activeChatStreams`.
+  final Set<String> _cancelledChatIds = {};
+
+  @visibleForTesting
+  void setSupportsToolsForModel(String model, bool value) {
+    _supportsToolsCache[model] = value;
+  }
 
   bool get isCurrentChatStreaming =>
       _activeChatStreams.containsKey(currentChat?.id);
 
-  bool get isCurrentChatThinking =>
-      currentChat != null &&
-      _activeChatStreams.containsKey(currentChat?.id) &&
-      _activeChatStreams[currentChat?.id] == null;
+  bool get isCurrentChatThinking {
+    if (currentChat == null) return false;
+    // Regular stream is thinking
+    if (_activeChatStreams.containsKey(currentChat?.id) &&
+        _activeChatStreams[currentChat?.id] == null) {
+      return true;
+    }
+    // A tool is running in the current chat
+    return _messages.any((m) => m.toolCall != null && _activeToolCalls.containsKey(m.id));
+  }
 
   /// A map of chat errors, indexed by chat ID.
   final Map<String, OllamaException> _chatErrors = {};
@@ -256,6 +278,8 @@ class ChatProvider extends ChangeNotifier {
   Future<void> _initializeChatStream(OllamaChat associatedChat) async {
     // Clear the active chat streams to cancel the previous stream
     _activeChatStreams.remove(associatedChat.id);
+    // Clear any previous cancel flag for this chat so the next stream can run.
+    _cancelledChatIds.remove(associatedChat.id);
 
     // Clear the error message associated with the chat
     if (_chatErrors.remove(associatedChat.id) != null) {
@@ -291,107 +315,246 @@ class ChatProvider extends ChangeNotifier {
       notifyListeners();
     }
 
-    // Save the Ollama message to the database
+    // Save the Ollama message to the database and notify listeners once more
     if (!kIsWeb && ollamaMessage != null) {
       await _databaseService.addMessage(ollamaMessage, chat: associatedChat);
+    }
+    if (ollamaMessage != null) {
+      // Ensure observers see the final assistant message state
+      notifyListeners();
     }
   }
 
   Future<OllamaMessage?> _streamOllamaMessage(OllamaChat associatedChat) async {
     if (_messages.isEmpty) return null;
 
-    // Build system prompt with currently known tools from connected servers
-    final allTools = await _mcpService.listTools();
-    final toolSystemPrompt = generateToolSystemPrompt({'connected': allTools});
+    int toolCallCount = 0;
 
-    final messagesWithSystemPrompt = [
-      OllamaMessage(toolSystemPrompt, role: OllamaMessageRole.system),
-      ..._messages,
-    ];
-
-    final stream = _ollamaService.chatStream(messagesWithSystemPrompt, chat: associatedChat);
-
-    OllamaMessage? streamingMessage;
-    OllamaMessage? receivedMessage;
-
-    await for (receivedMessage in stream) {
-      if (_activeChatStreams.containsKey(associatedChat.id) == false) {
-        streamingMessage?.createdAt = DateTime.now();
-        return streamingMessage;
+    // This loop handles multiple sequential tool calls.
+    while (toolCallCount < _maxToolCallsPerTurn) {
+      if (kDebugMode) {
+        debugPrint('[ChatProvider] loop start: toolCallCount=$toolCallCount chatId=${associatedChat.id}');
       }
-
-      if (streamingMessage == null) {
-        streamingMessage = receivedMessage;
-        _activeChatStreams[associatedChat.id] = streamingMessage;
-        if (associatedChat.id == currentChat?.id) {
-          _messages.add(streamingMessage);
-        }
-      } else {
-        streamingMessage.content += receivedMessage.content;
-      }
-
+      // Re-enable the thinking indicator for each iteration. After a tool call,
+      // the main stream indicator is cleared in _executeToolCall(). Without
+      // re-enabling here, the next stream might be considered cancelled.
+      _activeChatStreams[associatedChat.id] = null;
       notifyListeners();
 
-      final toolCall = _toolFlowActive ? null : parseToolCall(streamingMessage.content);
-      if (toolCall != null) {
-        _toolFlowActive = true;
-        // Finalize and save the tool call message
-        streamingMessage.createdAt = DateTime.now();
-        if (_dbEnabled) {
-          await _databaseService.addMessage(streamingMessage, chat: associatedChat);
+      // Build system prompt with currently known tools from connected servers
+      final allTools = await _mcpService.listTools();
+      final toolSystemPrompt = generateToolSystemPrompt(allTools);
+
+      final messagesWithSystemPrompt = [
+        OllamaMessage(toolSystemPrompt, role: OllamaMessageRole.system),
+        ..._messages,
+      ];
+
+      // Determine supportsTools with a small cache to avoid repeated network lookups
+      final cachedSupportsTools = _supportsToolsCache[associatedChat.model];
+      final resolvedSupportsTools = cachedSupportsTools ??
+          ((await _ollamaService.getModel(associatedChat.model))?.supportsTools ?? false);
+      _supportsToolsCache[associatedChat.model] = resolvedSupportsTools;
+      if (kDebugMode) {
+        debugPrint('[ChatProvider] supportsTools: cached=$cachedSupportsTools resolved=$resolvedSupportsTools model=${associatedChat.model}');
+      }
+
+      final stream = _ollamaService.chatStream(
+        messagesWithSystemPrompt,
+        chat: associatedChat,
+        supportsTools: resolvedSupportsTools,
+      );
+
+      OllamaMessage? streamingMessage;
+      OllamaMessage? receivedMessage;
+      McpToolCall? pendingToolCall;
+
+      await for (receivedMessage in stream) {
+        if (_cancelledChatIds.contains(associatedChat.id)) {
+          // Stream was cancelled by user
+          streamingMessage?.createdAt = DateTime.now();
+          return streamingMessage;
         }
 
-        // Explicitly cancel current stream for this chat
-        _activeChatStreams.remove(associatedChat.id);
+        if (streamingMessage == null) {
+          streamingMessage = receivedMessage;
+          _activeChatStreams[associatedChat.id] = streamingMessage;
+          // Always add the streaming assistant message for this associated chat
+          // so tests and non-UI contexts see the full transcript.
+          _messages.add(streamingMessage);
+          if (kDebugMode) {
+            debugPrint('[ChatProvider] streaming started: msgId=${streamingMessage.id}');
+          }
+        } else {
+          streamingMessage.content += receivedMessage.content;
+          // Important: if a tool call comes in chunks, merge it.
+          if (receivedMessage.toolCall != null) {
+            streamingMessage.toolCall = receivedMessage.toolCall;
+          }
+        }
+
         notifyListeners();
 
-        try {
-          // Execute the tool call
-          await _executeToolCall(associatedChat, toolCall);
-        } finally {
-          _toolFlowActive = false;
+        // A tool call has been detected. We'll execute it after the stream ends.
+        if (streamingMessage.toolCall != null) {
+          final tc = streamingMessage.toolCall!;
+          pendingToolCall = tc;
+          if (kDebugMode) {
+            debugPrint('[ChatProvider] tool call detected: server=${tc.server} name=${tc.name} args=${tc.args}');
+          }
+          break; // Exit stream to process the tool call
         }
-        return null; // Stop this stream; a new one will be started.
+      }
+
+      // After the stream is done for this turn...
+      if (pendingToolCall != null) {
+        toolCallCount++;
+
+        // Finalize and save the assistant message that contains the tool call
+        final sm = streamingMessage!;
+        sm.createdAt = DateTime.now();
+        if (_dbEnabled) {
+          await _databaseService.addMessage(sm, chat: associatedChat);
+        }
+
+        // Execute the tool call. This will add the result to _messages.
+        if (kDebugMode) {
+          debugPrint('[ChatProvider] executing tool call #$toolCallCount: ${pendingToolCall.server}/${pendingToolCall.name}');
+        }
+        await _executeToolCall(associatedChat, pendingToolCall);
+        if (kDebugMode) {
+          debugPrint('[ChatProvider] tool call finished #$toolCallCount: ${pendingToolCall.server}/${pendingToolCall.name}');
+        }
+
+        // If the tool call was cancelled, stop processing this turn.
+        final lastMessage = _messages.last;
+        if (lastMessage.role == OllamaMessageRole.tool && lastMessage.toolResult?.error == 'Cancelled') {
+          return null;
+        }
+        // Continue to the next iteration of the while loop.
+      } else {
+        // No tool call was made, this is the final response.
+        if (receivedMessage != null) {
+          streamingMessage?.updateMetadataFrom(receivedMessage);
+        }
+        streamingMessage?.createdAt = DateTime.now();
+        // Ensure the final message is in the list and notify observers
+        if (streamingMessage != null && !_messages.contains(streamingMessage)) {
+          _messages.add(streamingMessage);
+        }
+        // Always notify in case content/metadata changed
+        notifyListeners();
+        if (kDebugMode) {
+          debugPrint('[ChatProvider] final response produced: len=${streamingMessage?.content.length ?? 0}');
+        }
+        return streamingMessage; // Exit the loop and the function.
       }
     }
 
-    if (receivedMessage != null) {
-      streamingMessage?.updateMetadataFrom(receivedMessage);
-    }
-
-    streamingMessage?.createdAt = DateTime.now();
-
-    return streamingMessage;
+    // If we exit the loop due to max tool calls, return an error message.
+    final errorMessage = OllamaMessage(
+      "Exceeded maximum tool calls limit ($_maxToolCallsPerTurn).",
+      role: OllamaMessageRole.assistant,
+    );
+    errorMessage.createdAt = DateTime.now();
+    _messages.add(errorMessage);
+    notifyListeners();
+    return errorMessage;
   }
 
   Future<void> _executeToolCall(OllamaChat associatedChat, McpToolCall toolCall) async {
+    // A tool call is active, so the main stream is paused.
+    // Clear the thinking indicator for the main stream.
+    if (_activeChatStreams.containsKey(associatedChat.id)) {
+      _activeChatStreams.remove(associatedChat.id);
+    }
+    // Create a 'tool' message to show the thinking state
+    final toolMessage = OllamaMessage(
+      '', // Content is initially empty
+      role: OllamaMessageRole.tool,
+      toolCall: toolCall,
+    );
+    _messages.add(toolMessage);
+    _activeToolCalls[toolMessage.id] = true;
+    if (_dbEnabled) {
+      await _databaseService.addMessage(toolMessage, chat: associatedChat);
+    }
+    if (kDebugMode) {
+      debugPrint('[ChatProvider] tool message created: msgId=${toolMessage.id} for ${toolCall.server}/${toolCall.name}');
+    }
+    notifyListeners();
+
+    // If the call was cancelled while it was running, do nothing.
+    if (!_activeToolCalls.containsKey(toolMessage.id)) {
+      return;
+    }
+
+    // Validate arguments against tool schema (if any). If invalid, short-circuit
+    final validationErrors = _mcpService.validateToolArguments(toolCall.server, toolCall.name, toolCall.args);
+    if (validationErrors.isNotEmpty) {
+      final err = 'Invalid arguments: ${validationErrors.join('; ')}';
+      toolMessage.toolResult = McpToolResult(result: null, error: err);
+      toolMessage.content = 'Tool validation failed: $err';
+      _activeToolCalls.remove(toolMessage.id);
+      if (_dbEnabled) {
+        await _databaseService.updateMessage(
+          toolMessage,
+          newContent: toolMessage.content,
+          newToolResult: toolMessage.toolResult,
+        );
+      }
+      notifyListeners();
+      if (kDebugMode) {
+        debugPrint('[ChatProvider] tool args validation failed for ${toolCall.server}/${toolCall.name}: $err');
+      }
+      return;
+    }
+
+    McpToolResult toolResult;
     try {
+      if (kDebugMode) {
+        debugPrint('[ChatProvider] calling MCP tool: ${toolCall.server}/${toolCall.name} args=${toolCall.args}');
+      }
       final resp = await _mcpService.call(toolCall.server, toolCall.name, toolCall.args);
-      final formatted = formatToolResult(
-        toolCall.name,
-        resp.result,
-        error: resp.error,
+      toolResult = McpToolResult(
+        result: resp.result,
+        error: resp.error?.toString(),
       );
-      final resultMessage = OllamaMessage(formatted, role: OllamaMessageRole.assistant);
-      _messages.add(resultMessage);
-      if (!kIsWeb) {
-        await _databaseService.addMessage(resultMessage, chat: associatedChat);
-      }
     } catch (e) {
-      final errorMessage = OllamaMessage(
-        formatToolResult(toolCall.name, null, error: e.toString()),
-        role: OllamaMessageRole.assistant,
+      toolResult = McpToolResult(
+        result: null,
+        error: e.toString(),
       );
-      _messages.add(errorMessage);
-      if (!kIsWeb) {
-        await _databaseService.addMessage(errorMessage, chat: associatedChat);
-      }
+    }
+
+    // If cancelled after completion but before UI update, still do nothing.
+    if (!_activeToolCalls.containsKey(toolMessage.id)) {
+      return;
+    }
+
+    // Update the message with the result. The content is no longer needed
+    // as the structured tool_results will be sent to the model.
+    toolMessage.toolResult = toolResult;
+    toolMessage.content = 'Tool returned: ${toolResult.result ?? toolResult.error}';
+    if (kDebugMode) {
+      debugPrint('[ChatProvider] MCP tool result: ok=${toolResult.error == null} len=${toolMessage.content.length}');
+    }
+
+    _activeToolCalls.remove(toolMessage.id);
+    if (_dbEnabled) {
+      await _databaseService.updateMessage(
+        toolMessage,
+        newContent: toolMessage.content,
+        newToolResult: toolMessage.toolResult,
+      );
     }
 
     notifyListeners();
 
-    // Restart the stream with the tool result
-    await _initializeChatStream(associatedChat);
+    // The stream will be re-initialized by the loop in _streamOllamaMessage.
+    if (kDebugMode) {
+      debugPrint('[ChatProvider] tool call completed, returning to stream loop');
+    }
   }
 
   Future<void> regenerateMessage(OllamaMessage message) async {
@@ -457,9 +620,36 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  /// Cancels the current model streaming for the active chat.
+  ///
+  /// Sets a dedicated cancellation flag for the chat and removes the
+  /// thinking indicator. The streaming loop checks this flag to stop
+  /// gracefully on the next chunk.
   void cancelCurrentStreaming() {
-    _activeChatStreams.remove(currentChat?.id);
+    if (currentChat?.id != null) {
+      _cancelledChatIds.add(currentChat!.id);
+      _activeChatStreams.remove(currentChat!.id);
+    }
     notifyListeners();
+  }
+
+  void cancelToolCall(String messageId) {
+    if (_activeToolCalls.containsKey(messageId)) {
+      _activeToolCalls.remove(messageId);
+            final message = _messages.firstWhere((m) => m.id == messageId, orElse: () => OllamaMessage('', role: OllamaMessageRole.system));
+      if (message.id.isNotEmpty) {
+        message.content = 'Tool call cancelled by user.';
+        message.toolResult = McpToolResult(result: null, error: 'Cancelled');
+        if (_dbEnabled) {
+          _databaseService.updateMessage(
+            message,
+            newContent: message.content,
+            newToolResult: message.toolResult,
+          );
+        }
+      }
+      notifyListeners();
+    }
   }
 
   void _moveCurrentChatToTop() {
@@ -471,7 +661,8 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<List<OllamaModel>> fetchAvailableModels() async {
-    return await _ollamaService.listModels();
+    final models = await _ollamaService.listModelsWithCaps();
+    return models;
   }
 
   void _updateOllamaServiceAddress() {

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:reins/Constants/constants.dart';
+import 'package:reins/Models/mcp.dart';
 import 'package:reins/Models/ollama_chat.dart';
 import 'package:reins/Models/ollama_message.dart';
 import 'package:sqflite/sqflite.dart';
@@ -14,7 +15,7 @@ class DatabaseService {
   Future<void> open(String databaseFile) async {
     _db = await openDatabase(
       path.join(await getDatabasesPath(), databaseFile),
-      version: 2,
+      version: 3,
       onCreate: (Database db, int version) async {
         await db.execute('''CREATE TABLE IF NOT EXISTS chats (
 chat_id TEXT PRIMARY KEY,
@@ -30,6 +31,8 @@ chat_id TEXT NOT NULL,
 content TEXT NOT NULL,
 images TEXT,
 role TEXT CHECK(role IN ('user', 'assistant', 'system', 'tool')) NOT NULL,
+tool_call TEXT,
+tool_result TEXT,
 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
 FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
 ) WITHOUT ROWID;''');
@@ -61,6 +64,8 @@ END;''');
             content TEXT NOT NULL,
             images TEXT,
             role TEXT CHECK(role IN ('user', 'assistant', 'system', 'tool')) NOT NULL,
+            tool_call TEXT,
+            tool_result TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
           ) WITHOUT ROWID;''');
@@ -72,6 +77,38 @@ END;''');
           await db.execute('DROP TABLE messages_old;');
 
           // The trigger was dropped when the table was dropped, so we need to recreate it.
+          await db.execute('''CREATE TRIGGER IF NOT EXISTS delete_images_trigger
+          AFTER DELETE ON messages
+          WHEN OLD.images IS NOT NULL
+          BEGIN
+            INSERT INTO cleanup_jobs (image_paths) VALUES (OLD.images);
+          END;''');
+        }
+        if (oldVersion < 3) {
+          // Version 3 introduces tool_call and tool_result columns if not already present.
+          // Some users may already have them from v2 migration above, but ensure presence.
+          // SQLite lacks IF NOT EXISTS for ADD COLUMN before 3.35; safest is table recreate.
+          await db.execute('ALTER TABLE messages RENAME TO messages_old;');
+
+          await db.execute('''CREATE TABLE messages (
+            message_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            images TEXT,
+            role TEXT CHECK(role IN ('user', 'assistant', 'system', 'tool')) NOT NULL,
+            tool_call TEXT,
+            tool_result TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+          ) WITHOUT ROWID;''');
+
+          // Migrate old data; new columns default to NULL
+          await db.execute(
+              'INSERT INTO messages(message_id, chat_id, content, images, role, timestamp) SELECT message_id, chat_id, content, images, role, timestamp FROM messages_old;');
+
+          await db.execute('DROP TABLE messages_old;');
+
+          // Recreate trigger
           await db.execute('''CREATE TRIGGER IF NOT EXISTS delete_images_trigger
           AFTER DELETE ON messages
           WHEN OLD.images IS NOT NULL
@@ -194,11 +231,19 @@ ORDER BY last_update DESC;''');
   Future<void> updateMessage(
     OllamaMessage message, {
     String? newContent,
+    McpToolCall? newToolCall,
+    McpToolResult? newToolResult,
   }) async {
     await _db.update(
       'messages',
       {
         'content': newContent ?? message.content,
+        'tool_call': (newToolCall ?? message.toolCall) != null
+            ? jsonEncode((newToolCall ?? message.toolCall)!.toJson())
+            : null,
+        'tool_result': (newToolResult ?? message.toolResult) != null
+            ? jsonEncode((newToolResult ?? message.toolResult)!.toJson())
+            : null,
       },
       where: 'message_id = ?',
       whereArgs: [message.id],

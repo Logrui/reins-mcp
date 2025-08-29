@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:reins/Models/ollama_message.dart';
 import 'package:shimmer/shimmer.dart';
 
+import '../tool_call_message.dart';
 import 'chat_bubble/chat_bubble.dart';
 
 class ChatListView extends StatefulWidget {
@@ -107,7 +108,11 @@ class _ChatListViewState extends State<ChatListView> {
                 final message =
                     widget.messages[widget.messages.length - index - 1];
 
-                return ChatBubble(message: message);
+                if (message.role == OllamaMessageRole.tool) {
+                  return ToolCallMessage(message: message);
+                } else {
+                  return ChatBubble(message: message);
+                }
               },
             ),
           ],

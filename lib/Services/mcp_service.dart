@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
+
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart' as io;
 import 'package:http/http.dart' as http;
@@ -9,6 +10,7 @@ import 'package:json_rpc_2/json_rpc_2.dart' as rpc;
 
 import 'package:reins/Models/mcp.dart';
 import 'package:reins/Services/http_sse_channel.dart';
+import 'package:reins/Utils/json_schema_validator.dart';
 
 enum McpConnectionState { disconnected, connecting, connected, error }
 
@@ -83,7 +85,7 @@ class McpService extends ChangeNotifier {
       // success: reset retry counter
       _wsRetryCounts[serverUrl] = 0;
     } on TimeoutException {
-      debugPrint('MCP heartbeat timeout for $serverUrl');
+      if (kDebugMode) debugPrint('MCP heartbeat timeout for $serverUrl');
       _scheduleWsReconnect(serverUrl);
     } on rpc.RpcException catch (e) {
       if (e.code == -32601) {
@@ -107,7 +109,7 @@ class McpService extends ChangeNotifier {
     final attempt = (_wsRetryCounts[serverUrl] ?? 0).clamp(0, 5);
     final delay = Duration(seconds: [1, 2, 4, 8, 16, 32][attempt]);
     _wsRetryCounts[serverUrl] = attempt + 1;
-    debugPrint('MCP WS reconnect to $serverUrl in ${delay.inSeconds}s');
+    if (kDebugMode) debugPrint('MCP WS reconnect to $serverUrl in ${delay.inSeconds}s');
     Timer(delay, () async {
       try {
         // tear down old channel if any
@@ -132,7 +134,7 @@ class McpService extends ChangeNotifier {
         _startHeartbeat(serverUrl);
         await _listToolsForServer(serverUrl);
       } catch (e) {
-        debugPrint('MCP WS reconnect failed for $serverUrl: $e');
+        if (kDebugMode) debugPrint('MCP WS reconnect failed for $serverUrl: $e');
         _scheduleWsReconnect(serverUrl);
       }
     });
@@ -143,6 +145,53 @@ class McpService extends ChangeNotifier {
   String? getLastError(String serverUrl) => _lastErrors[serverUrl];
   List<McpTool> getTools(String serverUrl) => _serverTools[serverUrl] ?? [];
   List<McpTool> get allTools => _serverTools.values.expand((tools) => tools).toList();
+
+  /// Lookup a tool by fully-qualified name (e.g., "server.tool") or by name within a specific server.
+  McpTool? findTool({String? serverUrl, required String toolName}) {
+    if (serverUrl != null) {
+      final tools = _serverTools[serverUrl] ?? const <McpTool>[];
+      return tools.firstWhere(
+        (t) => t.name == toolName,
+        orElse: () => tools.firstWhere(
+          (t) => t.name.endsWith('.$toolName'),
+          orElse: () => McpTool(name: '', description: '', parameters: const {}),
+        ),
+      ).name.isEmpty
+          ? null
+          : tools.firstWhere((t) => t.name == toolName || t.name.endsWith('.$toolName'));
+    }
+    final all = allTools;
+    try {
+      return all.firstWhere((t) => t.name == toolName || t.name.endsWith('.$toolName'));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Validate tool arguments against the tool's JSON Schema (if provided).
+  /// Returns a list of human-readable validation errors; empty means valid.
+  List<String> validateToolArguments(String serverUrl, String toolName, Map<String, dynamic> arguments) {
+    final tool = findTool(serverUrl: serverUrl, toolName: toolName);
+    if (tool == null) return ['Unknown tool: $toolName'];
+    final schema = tool.parameters;
+    if (schema.isEmpty) return const <String>[]; // no schema -> accept
+    // Some gateways wrap schema under { type: 'object', properties: {...} }
+    Map<String, dynamic> effectiveSchema;
+    if (schema.containsKey('type')) {
+      effectiveSchema = schema;
+    } else if (schema.containsKey('properties') || schema.containsKey('required')) {
+      effectiveSchema = {
+        'type': 'object',
+        ...schema,
+      };
+    } else {
+      // Unknown shape, accept to avoid false negatives
+      return const <String>[];
+    }
+
+    final validator = JsonSchemaValidator();
+    return validator.validate(effectiveSchema, arguments, path: 'args');
+  }
 
   void _setState(String serverUrl, McpConnectionState state) {
     _states[serverUrl] = state;
@@ -158,6 +207,26 @@ class McpService extends ChangeNotifier {
     for (final server in servers) {
       await connect(server.endpoint, authToken: server.authToken);
     }
+  }
+
+  /// Test-only: attach an in-memory Peer and initialize/list tools without real network.
+  ///
+  /// This allows unit tests to simulate an MCP server using a json_rpc_2.Server
+  /// paired to [peer] via an in-memory StreamChannel.
+  @visibleForTesting
+  Future<void> attachPeerAndInitialize(String serverUrl, rpc.Peer peer) async {
+    // attach a dummy channel to satisfy _rpc()'s channel presence check
+    _channels[serverUrl] = DummyMessageChannel();
+    _wsPeers[serverUrl] = peer;
+    peer.listen();
+    _setState(serverUrl, McpConnectionState.connecting);
+    final ok = await _initialize(serverUrl);
+    if (!ok) {
+      _setState(serverUrl, McpConnectionState.error);
+      return;
+    }
+    await _listToolsForServer(serverUrl);
+    _setState(serverUrl, McpConnectionState.connected);
   }
 
   /// Connect to MCP server using HTTP or WebSocket transport
@@ -215,7 +284,7 @@ class McpService extends ChangeNotifier {
       await _listToolsForServer(serverUrl);
       notifyListeners();
     } catch (e) {
-      debugPrint('Failed to connect to MCP server at $serverUrl: $e');
+      if (kDebugMode) debugPrint('Failed to connect to MCP server at $serverUrl: $e');
       _lastErrors[serverUrl] = e.toString();
       _setState(serverUrl, McpConnectionState.error);
       disconnect(serverUrl);
@@ -230,10 +299,10 @@ class McpService extends ChangeNotifier {
     }
 
     if (kIsWeb) {
-      debugPrint('MCP WebSocket connect (web) -> $uri');
+      if (kDebugMode) debugPrint('MCP WebSocket connect (web) -> $uri');
       return WebSocketMessageChannel(WebSocketChannel.connect(uri));
     } else {
-      debugPrint('MCP WebSocket connect -> $uri');
+      if (kDebugMode) debugPrint('MCP WebSocket connect -> $uri');
       final ws = io.IOWebSocketChannel.connect(
         uri,
         protocols: ['jsonrpc-2.0'],
@@ -250,7 +319,7 @@ class McpService extends ChangeNotifier {
       headers['Authorization'] = 'Bearer $authToken';
     }
 
-    debugPrint('MCP HTTP connect -> $uri');
+    if (kDebugMode) debugPrint('MCP HTTP connect -> $uri');
     final client = http.Client();
     // Use StreamChannel-based HTTP/SSE channel and wrap with json_rpc_2.Peer
     final sse = HttpSseStreamChannel(client, uri, headers);
@@ -312,15 +381,15 @@ class McpService extends ChangeNotifier {
       }).timeout(const Duration(seconds: 20));
 
       if (response.error != null) {
-        debugPrint('MCP initialize error: ${response.error}');
+        if (kDebugMode) debugPrint('MCP initialize error: ${response.error}');
         _lastErrors[serverUrl] = 'Initialize failed: ${response.error}';
         return false;
       }
 
-      debugPrint('MCP initialized successfully for $serverUrl');
+      if (kDebugMode) debugPrint('MCP initialized successfully for $serverUrl');
       return true;
     } catch (e) {
-      debugPrint('MCP initialize timeout/error for $serverUrl: $e');
+      if (kDebugMode) debugPrint('MCP initialize timeout/error for $serverUrl: $e');
       _lastErrors[serverUrl] = 'Initialize failed: $e';
       return false;
     }
@@ -333,7 +402,7 @@ class McpService extends ChangeNotifier {
           .timeout(const Duration(seconds: 15));
 
       if (response.error != null) {
-        debugPrint('MCP tools/list error: ${response.error}');
+        if (kDebugMode) debugPrint('MCP tools/list error: ${response.error}');
         _lastErrors[serverUrl] = response.error.toString();
         return;
       }
@@ -351,9 +420,9 @@ class McpService extends ChangeNotifier {
       }
 
       _serverTools[serverUrl] = tools;
-      debugPrint('MCP loaded ${tools.length} tools from $serverUrl');
+      if (kDebugMode) debugPrint('MCP loaded ${tools.length} tools from $serverUrl');
     } catch (e) {
-      debugPrint('MCP tools/list failed for $serverUrl: $e');
+      if (kDebugMode) debugPrint('MCP tools/list failed for $serverUrl: $e');
       _lastErrors[serverUrl] = 'Failed to list tools: $e';
     }
   }
@@ -369,7 +438,7 @@ class McpService extends ChangeNotifier {
     final peer = _wsPeers[serverUrl];
     if (peer != null) {
       try {
-        debugPrint('MCP(WS Peer) -> $method');
+        if (kDebugMode) debugPrint('MCP(WS Peer) -> $method');
         final result = await peer.sendRequest(method, params);
         return McpResponse(result: result, error: null, id: 'peer');
       } on rpc.RpcException catch (e) {
@@ -398,7 +467,7 @@ class McpService extends ChangeNotifier {
     _pendingRequests[id] = completer;
     _requestServerById[id] = serverUrl;
 
-    debugPrint('MCP -> $method id=$id');
+    if (kDebugMode) debugPrint('MCP -> $method id=$id');
     channel.sink.add(request.toJson());
 
     return completer.future;
@@ -567,11 +636,11 @@ class HttpMessageChannel implements MessageChannel {
           .firstMatch(parsed.toString())
           ?.group(2);
     } catch (e) {
-      debugPrint('MCP session parse error for "$data": $e');
+      if (kDebugMode) debugPrint('MCP session parse error for "$data": $e');
     }
 
     if (sessionId == null || sessionId.isEmpty) {
-      debugPrint('MCP could not extract session id from: $data');
+      if (kDebugMode) debugPrint('MCP could not extract session id from: $data');
       return;
     }
 
@@ -600,9 +669,9 @@ class HttpMessageChannel implements MessageChannel {
     _sessionId = sessionId;
     _sessionEndpoint = preferred;
     _sessionEndpointAlt = canonical == preferred ? null : canonical;
-    debugPrint('MCP preferred session endpoint: $_sessionEndpoint');
+    if (kDebugMode) debugPrint('MCP preferred session endpoint: $_sessionEndpoint');
     if (_sessionEndpointAlt != null) {
-      debugPrint('MCP alt session endpoint: $_sessionEndpointAlt');
+      if (kDebugMode) debugPrint('MCP alt session endpoint: $_sessionEndpointAlt');
     }
     if (_sessionReady != null && !(_sessionReady!.isCompleted)) {
       _sessionReady!.complete(_sessionEndpoint!);
@@ -621,7 +690,7 @@ class HttpMessageChannel implements MessageChannel {
         ..._headers,
       });
 
-      debugPrint('MCP HTTP/SSE connecting to: $sseUri');
+      if (kDebugMode) debugPrint('MCP HTTP/SSE connecting to: $sseUri');
       final sseResponse = await _client.send(sseRequest);
       
       if (sseResponse.statusCode != 200) {
@@ -655,20 +724,20 @@ class HttpMessageChannel implements MessageChannel {
               _processSSELine(trimmed);
             }
           } catch (e) {
-            debugPrint('MCP HTTP/SSE decode error: $e');
+            if (kDebugMode) debugPrint('MCP HTTP/SSE decode error: $e');
           }
         },
         onError: (error) {
-          debugPrint('MCP HTTP/SSE stream error: $error');
+          if (kDebugMode) debugPrint('MCP HTTP/SSE stream error: $error');
           _controller.addError(error);
         },
         onDone: () {
-          debugPrint('MCP HTTP/SSE stream closed');
+          if (kDebugMode) debugPrint('MCP HTTP/SSE stream closed');
           _controller.close();
         },
       );
     } catch (e) {
-      debugPrint('MCP HTTP/SSE connection failed: $e');
+      if (kDebugMode) debugPrint('MCP HTTP/SSE connection failed: $e');
     }
   }
 
@@ -676,7 +745,7 @@ class HttpMessageChannel implements MessageChannel {
   void _processSSELine(String line) {
     if (line.startsWith('event:')) {
       _currentEvent = line.substring(6).trim();
-      debugPrint('MCP SSE event: $_currentEvent');
+      if (kDebugMode) debugPrint('MCP SSE event: $_currentEvent');
       return;
     }
 
@@ -707,7 +776,7 @@ class HttpMessageChannel implements MessageChannel {
 
     // Unknown non-empty line
     if (trimmed.isNotEmpty) {
-      debugPrint('MCP HTTP/SSE unknown line: $line');
+      if (kDebugMode) debugPrint('MCP HTTP/SSE unknown line: $line');
     }
   }
 
@@ -724,28 +793,28 @@ class HttpMessageChannel implements MessageChannel {
 
     if (eventName == 'endpoint') {
       // endpoint handshake: normalize session endpoint
-      debugPrint('MCP SSE endpoint data: $data');
+      if (kDebugMode) debugPrint('MCP SSE endpoint data: $data');
       _setSessionEndpointFromData(data);
       return;
     }
 
     if (data.startsWith('{') || data.startsWith('[')) {
       try {
-        debugPrint('MCP SSE message payload (first 200): ${data.substring(0, data.length > 200 ? 200 : data.length)}');
+        if (kDebugMode) debugPrint('MCP SSE message payload (first 200): ${data.substring(0, data.length > 200 ? 200 : data.length)}');
         final decoded = jsonDecode(data);
 
         void forward(dynamic obj) {
           try {
             if (obj is Map && obj.containsKey('id')) {
-              debugPrint('MCP SSE forward response id=${obj['id']}');
+              if (kDebugMode) debugPrint('MCP SSE forward response id=${obj['id']}');
             } else if (obj is Map && obj.containsKey('method')) {
-              debugPrint('MCP SSE forward notification method=${obj['method']}');
+              if (kDebugMode) debugPrint('MCP SSE forward notification method=${obj['method']}');
             } else {
-              debugPrint('MCP SSE forward untyped object');
+              if (kDebugMode) debugPrint('MCP SSE forward untyped object');
             }
             _controller.add(obj);
           } catch (e) {
-            debugPrint('MCP HTTP/SSE forward error: $e');
+            if (kDebugMode) debugPrint('MCP HTTP/SSE forward error: $e');
           }
         }
 
@@ -801,11 +870,11 @@ class HttpMessageChannel implements MessageChannel {
           forward(decoded);
         }
       } catch (e) {
-        debugPrint('MCP HTTP/SSE JSON parse error: $e');
+        if (kDebugMode) debugPrint('MCP HTTP/SSE JSON parse error: $e');
       }
     } else {
       // Non-JSON payload may carry session endpoint
-      debugPrint('MCP HTTP/SSE received non-JSON data (event=$eventName): $data');
+      if (kDebugMode) debugPrint('MCP HTTP/SSE received non-JSON data (event=$eventName): $data');
       if (
         data.startsWith('?sessionid=') ||
         data.startsWith('?sessionId=') ||
@@ -850,7 +919,7 @@ class HttpMessageSink implements MessageSink {
     try {
       // If data is already a JSON string (e.g., McpRequest.toJson()), don't re-encode.
       final String message = data is String ? data : jsonEncode(data);
-      debugPrint('MCP HTTP sending message: $message');
+      if (kDebugMode) debugPrint('MCP HTTP sending message: $message');
       
       // Build endpoint list with session endpoint first if available
       final endpoints = <Uri>[];
@@ -876,26 +945,26 @@ class HttpMessageSink implements MessageSink {
       
       for (final endpoint in endpoints) {
         try {
-          debugPrint('MCP HTTP trying POST to: $endpoint');
+          if (kDebugMode) debugPrint('MCP HTTP trying POST to: $endpoint');
           response = await _postWithRedirects(endpoint, message);
 
           // Success - break out of loop
           if (response.statusCode >= 200 && response.statusCode < 300) {
-            debugPrint('MCP HTTP POST success to: $endpoint');
+            if (kDebugMode) debugPrint('MCP HTTP POST success to: $endpoint');
             break;
           } else if (response.statusCode == 400) {
             // Bad Request - log the response body for debugging
-            debugPrint('MCP HTTP POST 400 Bad Request to $endpoint: ${response.reasonPhrase}');
-            debugPrint('Response body: ${response.body}');
+            if (kDebugMode) debugPrint('MCP HTTP POST 400 Bad Request to $endpoint: ${response.reasonPhrase}');
+            if (kDebugMode) debugPrint('Response body: ${response.body}');
           } else if (response.statusCode != 404 && response.statusCode != 405) {
             // Not a "not found" or "method not allowed" - might be other error worth reporting
-            debugPrint('MCP HTTP POST failed to $endpoint: ${response.statusCode} ${response.reasonPhrase}');
+            if (kDebugMode) debugPrint('MCP HTTP POST failed to $endpoint: ${response.statusCode} ${response.reasonPhrase}');
             if (response.body.isNotEmpty) {
-              debugPrint('Response body: ${response.body}');
+              if (kDebugMode) debugPrint('Response body: ${response.body}');
             }
           }
         } catch (e) {
-          debugPrint('MCP HTTP POST error to $endpoint: $e');
+          if (kDebugMode) debugPrint('MCP HTTP POST error to $endpoint: $e');
           continue;
         }
       }
@@ -906,16 +975,16 @@ class HttpMessageSink implements MessageSink {
           try {
             final responseJson = jsonDecode(response.body);
             // Don't add to stream - SSE handles incoming messages
-            debugPrint('MCP HTTP POST response: $responseJson');
+            if (kDebugMode) debugPrint('MCP HTTP POST response: $responseJson');
           } catch (e) {
-            debugPrint('MCP HTTP response parse error: $e');
+            if (kDebugMode) debugPrint('MCP HTTP response parse error: $e');
           }
         }
       } else {
-        debugPrint('MCP HTTP send failed to all endpoints');
+        if (kDebugMode) debugPrint('MCP HTTP send failed to all endpoints');
       }
     } catch (e) {
-      debugPrint('MCP HTTP send error: $e');
+      if (kDebugMode) debugPrint('MCP HTTP send error: $e');
     }
   }
 
@@ -924,7 +993,7 @@ class HttpMessageSink implements MessageSink {
     var redirectCount = 0;
 
     while (redirectCount < maxRedirects) {
-      debugPrint('MCP HTTP POST attempt ${redirectCount + 1} to: $currentUri');
+      if (kDebugMode) debugPrint('MCP HTTP POST attempt ${redirectCount + 1} to: $currentUri');
       
       final response = await _client.post(
         currentUri,
@@ -935,11 +1004,11 @@ class HttpMessageSink implements MessageSink {
         body: body,
       );
 
-      debugPrint('MCP HTTP response: ${response.statusCode} ${response.reasonPhrase}');
+      if (kDebugMode) debugPrint('MCP HTTP response: ${response.statusCode} ${response.reasonPhrase}');
 
       if (response.statusCode == 307 || response.statusCode == 302 || response.statusCode == 301) {
         final location = response.headers['location'];
-        debugPrint('MCP HTTP redirect location header: $location');
+        if (kDebugMode) debugPrint('MCP HTTP redirect location header: $location');
         
         if (location != null && location.isNotEmpty) {
           Uri nextUri;
@@ -960,12 +1029,12 @@ class HttpMessageSink implements MessageSink {
             nextUri = currentUri.resolve(location);
           }
           
-          debugPrint('MCP HTTP redirect ${redirectCount + 1}: $currentUri -> $nextUri');
+          if (kDebugMode) debugPrint('MCP HTTP redirect ${redirectCount + 1}: $currentUri -> $nextUri');
           currentUri = nextUri;
           redirectCount++;
           continue;
         } else {
-          debugPrint('MCP HTTP redirect without location header');
+          if (kDebugMode) debugPrint('MCP HTTP redirect without location header');
           return response;
         }
       }
@@ -980,4 +1049,28 @@ class HttpMessageSink implements MessageSink {
   Future<void> close() async {
     // HTTP client will be closed by the channel
   }
+}
+
+/// Minimal no-op message channel useful for tests.
+class DummyMessageChannel implements MessageChannel {
+  final StreamController<dynamic> _controller = StreamController<dynamic>.broadcast();
+
+  @override
+  Stream<dynamic> get stream => _controller.stream;
+
+  @override
+  MessageSink get sink => _DummySink();
+
+  @override
+  Future<void> close() async {
+    await _controller.close();
+  }
+}
+
+class _DummySink implements MessageSink {
+  @override
+  void add(dynamic data) {}
+
+  @override
+  Future<void> close() async {}
 }

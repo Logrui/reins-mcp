@@ -8,6 +8,8 @@ import 'package:provider/provider.dart';
 import 'package:reins/Providers/chat_provider.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:responsive_framework/responsive_framework.dart';
+import 'package:reins/Models/ollama_model.dart';
+import 'package:reins/Services/ollama_service.dart';
 
 class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   const ChatAppBar({super.key});
@@ -53,19 +55,26 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   Future<void> _handleModelSelectionButton(BuildContext context) async {
     final chatProvider = Provider.of<ChatProvider>(context, listen: false);
 
-    final selectedModelName = await showSelectionBottomSheet(
-      key: ValueKey("${Hive.box('settings').get('serverAddress')}-string"),
+    final OllamaModel? selectedModel = await showSelectionBottomSheet<OllamaModel>(
+      key: ValueKey("${Hive.box('settings').get('serverAddress')}-ollama-model"),
       context: context,
       header: OllamaBottomSheetHeader(title: "Change The Model"),
       fetchItems: () async {
-        final models = await chatProvider.fetchAvailableModels();
-
-        return models.map((model) => model.name).toList();
+        // Use basic model list - SelectionBottomSheet will enrich with capabilities
+        final ollamaService = OllamaService();
+        final models = await ollamaService.listModels();
+        return models;
       },
-      currentSelection: chatProvider.currentChat!.model,
+      // We only know the current model name string; use value-based selection
+      currentSelection: null,
+      currentSelectionValue: chatProvider.currentChat!.model,
+      valueSelector: (m) => m.name,
+      // No custom itemBuilder needed - SelectionBottomSheet handles Tools badges
     );
 
-    await chatProvider.updateCurrentChat(newModel: selectedModelName);
+    if (selectedModel != null) {
+      await chatProvider.updateCurrentChat(newModel: selectedModel.name);
+    }
   }
 
   Future<void> _handleConfigureButton(BuildContext context) async {

@@ -36,6 +36,7 @@ dependencies:
   async: ^2.11.0
   json_rpc_2: ^3.0.2
   stream_channel: ^2.1.2
+  meta: ^1.15.0
 
   # State management solution
   provider: ^6.1.2

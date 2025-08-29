@@ -157,18 +157,25 @@ class OllamaService {
   Stream<OllamaMessage> chatStream(
     List<OllamaMessage> messages, {
     required OllamaChat chat,
+    bool supportsTools = false,
   }) async* {
     final url = constructUrl('/api/chat');
 
     final request = http.Request("POST", url);
     request.headers.addAll(headers);
-    request.body = json.encode({
-      "model": chat.model,
-      "messages":
-          await _prepareMessagesWithSystemPrompt(messages, chat.systemPrompt),
-      "options": chat.options.toMap(),
-      "stream": true,
-    });
+    final payload = {
+      'model': chat.model,
+      'messages': await _prepareMessagesWithSystemPrompt(messages, chat.systemPrompt),
+      'options': chat.options.toMap(),
+      'stream': true,
+    };
+
+    if (supportsTools) {
+      // This is a placeholder for now. In the future, we'll pass the actual tool definitions.
+      payload['tools'] = []; 
+    }
+
+    request.body = json.encode(payload);
 
     http.StreamedResponse response = await request.send();
 
@@ -231,14 +238,20 @@ class OllamaService {
   /// Lists the available models on the Ollama service.
   Future<List<OllamaModel>> listModels() async {
     final url = constructUrl("/api/tags");
+    print('[listModels] Fetching models from $url');
 
     final response = await http.get(url, headers: headers);
 
     if (response.statusCode == 200) {
       final jsonBody = json.decode(response.body);
-      return List<OllamaModel>.from(
+      print('[listModels] Raw response: ${jsonBody.toString().substring(0, 200)}...');
+      
+      final models = List<OllamaModel>.from(
         jsonBody["models"].map((m) => OllamaModel.fromJson(m)),
       );
+      
+      print('[listModels] Parsed ${models.length} models');
+      return models;
     } else if (response.statusCode == 500) {
       throw OllamaException("Internal server error.");
     } else {
@@ -290,6 +303,73 @@ class OllamaService {
       throw OllamaException("Internal server error.");
     } else {
       throw OllamaException("Something went wrong.");
+    }
+  }
+
+  /// Fetch detailed model information from Ollama's /api/show.
+  /// Returns the raw metadata map as provided by the server.
+  Future<Map<String, dynamic>> fetchModelInfo(String model) async {
+    final url = constructUrl('/api/show');
+
+    final response = await http.post(
+      url,
+      headers: headers,
+      body: json.encode({'name': model}),
+    );
+
+    if (response.statusCode == 200) {
+      final jsonBody = json.decode(response.body) as Map<String, dynamic>;
+      
+      // Extract capabilities without logging
+      
+      return jsonBody;
+    } else if (response.statusCode == 404) {
+      throw OllamaException("$model not found on the server.");
+    } else if (response.statusCode == 500) {
+      throw OllamaException("Internal server error.");
+    } else {
+      throw OllamaException("Something went wrong.");
+    }
+  }
+
+  /// Lists models and enriches them with capabilities and supportsTools flag.
+  Future<List<OllamaModel>> listModelsWithCaps() async {
+    final models = await listModels();
+
+    // Enrich each model with capabilities from /api/show
+    final enrichedModels = await Future.wait(models.map((m) async {
+      try {
+        final info = await fetchModelInfo(m.name);
+        final caps = (info['capabilities'] as List?)?.map((e) => e.toString().toLowerCase()).toList() ?? [];
+        
+        final supportsTools = caps.contains('tools') || caps.contains('tool');
+        
+        return OllamaModel(
+          name: m.name,
+          model: m.model,
+          modifiedAt: m.modifiedAt,
+          size: m.size,
+          digest: m.digest,
+          details: m.details,
+          capabilities: caps,
+          supportsTools: supportsTools,
+        );
+      } catch (e) {
+        // If we can't fetch capabilities, return the original model
+        return m;
+      }
+    }));
+    
+    return enrichedModels;
+  }
+
+  /// Gets a single model by name, enriched with capabilities.
+  Future<OllamaModel?> getModel(String modelName) async {
+    final models = await listModelsWithCaps();
+    try {
+      return models.firstWhere((m) => m.name == modelName);
+    } catch (e) {
+      return null;
     }
   }
 }

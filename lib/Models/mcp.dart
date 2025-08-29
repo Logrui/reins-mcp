@@ -147,28 +147,50 @@ class McpError {
   }
 }
 
-// Represents a tool call request emitted by the LLM via sentinel.
+// Represents a tool call request emitted by the LLM.
 class McpToolCall {
+  final String id; // The unique ID for this tool call
   final String server; // server name or endpoint key
   final String name; // tool name
   final Map<String, dynamic> args; // arguments
 
   McpToolCall({
+    required this.id,
     required this.server,
     required this.name,
     required this.args,
   });
 
-  factory McpToolCall.fromJson(Map<String, dynamic> json) => McpToolCall(
+  // Handles both the new structured format from Ollama and the old sentinel format.
+  factory McpToolCall.fromJson(Map<String, dynamic> json) {
+    if (json.containsKey('function')) {
+      // New structured format from Ollama `tool_calls`
+      final function = json['function'] as Map<String, dynamic>;
+      final name = function['name'] as String;
+      final server = name.split('.').first; // Convention: 'server.tool_name'
+      return McpToolCall(
+        id: json['id'] as String,
+        server: server,
+        name: name,
+        args: (function['arguments'] as Map).cast<String, dynamic>(),
+      );
+    } else {
+      // Legacy sentinel format
+      return McpToolCall(
+        id: '', // No ID in old format
         server: json['server'],
         name: json['name'],
         args: (json['args'] as Map).cast<String, dynamic>(),
       );
+    }
+  }
 
   Map<String, dynamic> toJson() => {
-        'server': server,
-        'name': name,
-        'args': args,
+        'id': id,
+        'function': {
+          'name': name,
+          'arguments': args,
+        },
       };
 }
 
@@ -178,6 +200,11 @@ class McpToolResult {
   final String? error;
 
   McpToolResult({this.result, this.error});
+
+  factory McpToolResult.fromJson(Map<String, dynamic> json) => McpToolResult(
+        result: json['result'],
+        error: json['error'],
+      );
 
   Map<String, dynamic> toJson() => {
         if (result != null) 'result': result,

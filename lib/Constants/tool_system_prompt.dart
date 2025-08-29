@@ -1,38 +1,24 @@
+import 'dart:convert';
 import 'package:reins/Models/mcp.dart';
 
-const String toolSystemPromptPrefix = '''
-You can call external tools when needed.
-
-When you need a tool, output exactly one line in this format and nothing else:
-TOOL_CALL: {"server": "<server>", "name": "<tool>", "args": { /* json args */ }}
-
-Example:
-TOOL_CALL: {"server": "local", "name": "calculator", "args": {"expression": "2+2"}}
-
-After execution, you'll receive a line starting with `TOOL_RESULT:` containing a JSON object with `name`, and either `result` or `error`. Use it to finalize your answer.
-
-Available tools:
-''';
-
-String generateToolSystemPrompt(Map<String, List<McpTool>> serverTools) {
-  final prompt = StringBuffer(toolSystemPromptPrefix);
-
-  if (serverTools.isEmpty) {
-    prompt.writeln('  - No tools available.');
-    return prompt.toString();
+// Generates a system prompt that describes the available tools to the model.
+String generateToolSystemPrompt(List<McpTool> tools) {
+  if (tools.isEmpty) {
+    return 'You have no tools available.';
   }
 
-  serverTools.forEach((server, tools) {
-    prompt.writeln('Server: `$server`');
-    if (tools.isEmpty) {
-      prompt.writeln('  - No tools available on this server.');
-    } else {
-      for (var tool in tools) {
-        prompt.writeln('  - `${tool.name}`: ${tool.description}');
-        prompt.writeln('    Args schema: ${tool.parameters}');
-      }
-    }
-  });
+  final toolDefinitions = tools.map((tool) {
+    return {
+      'name': tool.name,
+      'description': tool.description,
+      'parameters': tool.parameters,
+    };
+  }).toList();
 
-  return prompt.toString();
+  // This is a simplified JSON representation for the prompt.
+  // A more robust implementation might use a dedicated JSON schema for tools.
+  return '''You have access to the following tools. Use them when appropriate.
+
+${jsonEncode(toolDefinitions)}
+''';
 }

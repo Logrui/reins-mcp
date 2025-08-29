@@ -29,6 +29,8 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
   final StringBuffer _chunkBuffer = StringBuffer();
   final StringBuffer _eventData = StringBuffer();
   String _currentEvent = '';
+  // Minimal cookie jar for gateways that use Set-Cookie on redirect/session
+  String? _cookieHeader;
 
   // Session endpoint handling
   Uri? _preferredEndpoint; // e.g., /message?sessionId=...
@@ -38,6 +40,26 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
   HttpSseStreamChannel(this._client, this._baseUri, this._headers) {
     _sink = _HttpSseSink(this);
     _connectSse();
+  }
+
+  // Resolve a redirect Location header against a base URI.
+  Uri _resolveRedirect(Uri base, String location) {
+    try {
+      if (location.startsWith('http://') || location.startsWith('https://')) {
+        return Uri.parse(location);
+      }
+      if (location.startsWith('/')) {
+        return Uri(
+          scheme: base.scheme,
+          host: base.host,
+          port: base.hasPort ? base.port : null,
+          path: location,
+        );
+      }
+      return base.resolve(location);
+    } catch (_) {
+      return base; // fallback
+    }
   }
 
   // Public API
@@ -55,8 +77,54 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
     _client.close();
   }
 
+  // Generic redirect follower for streamed requests, with cookie propagation.
+  Future<http.StreamedResponse> _sendWithRedirects(http.Request request, {int maxRedirects = 5}) async {
+    var currentReq = request;
+    var redirects = 0;
+    while (true) {
+      if (_cookieHeader != null) currentReq.headers['Cookie'] = _cookieHeader!;
+      final res = await _client.send(currentReq);
+      final setCookie = res.headers['set-cookie'];
+      if (setCookie != null && setCookie.isNotEmpty) {
+        _cookieHeader = _extractCookieHeader(setCookie);
+      }
+      final status = res.statusCode;
+      if (status == 301 || status == 302 || status == 307) {
+        if (redirects++ >= maxRedirects) {
+          return res;
+        }
+        final loc = res.headers['location'];
+        if (loc == null || loc.isEmpty) {
+          return res;
+        }
+        final nextUri = _resolveRedirect(currentReq.url, loc);
+        final nextReq = http.Request(currentReq.method, nextUri);
+        nextReq.headers.addAll(currentReq.headers);
+        if (currentReq.method != 'GET') {
+          nextReq.bodyBytes = await currentReq.finalize().toBytes();
+        }
+        currentReq = nextReq;
+        continue;
+      }
+      return res;
+    }
+  }
+
+  String _extractCookieHeader(String setCookie) {
+    // Take only cookie-pairs (name=value) and join for Cookie header
+    // naive split by comma may break with expires, so split on ';' first item
+    // Support multiple Set-Cookie by comma-separated: pick first pair of each
+    final parts = setCookie.split(',');
+    final pairs = <String>[];
+    for (final p in parts) {
+      final semi = p.split(';').first.trim();
+      if (semi.contains('=')) pairs.add(semi);
+    }
+    return pairs.join('; ');
+  }
+
   // Wait for a session endpoint if possible, otherwise return what we have.
-  Future<Uri?> waitForSession({Duration timeout = const Duration(seconds: 3)}) async {
+  Future<Uri?> waitForSession({Duration timeout = const Duration(seconds: 10)}) async {
     if (_preferredEndpoint != null) return _preferredEndpoint;
     _sessionReady ??= Completer<Uri>();
     try {
@@ -73,19 +141,76 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
   // Internal: SSE connect and parsing
   Future<void> _connectSse() async {
     try {
-      final sseUri = _baseUri.resolve('/sse');
-      final req = http.Request('GET', sseUri);
-      req.headers.addAll({
-        'Accept': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        ..._headers,
-      });
+      // Try a set of common SSE endpoints to be resilient to gateway pathing.
+      final candidates = <Uri>[
+        _baseUri.resolve('/sse'),
+        _baseUri.resolve('/sse/connect'),
+        _baseUri, // some gateways serve SSE at base
+        _baseUri.resolve('/events'),
+        _baseUri.resolve('/events/connect'),
+        _baseUri.resolve('/stream'),
+        _baseUri.resolve('/mcp/sse'),
+        _baseUri.resolve('/gateway/sse'),
+      ];
 
-      debugPrint('HttpSseStreamChannel connecting to $sseUri');
-      final res = await _client.send(req);
-      if (res.statusCode != 200) {
-        throw Exception('SSE connection failed: ${res.statusCode}');
+      http.StreamedResponse? res;
+      Uri? connected;
+      for (final sseUri in candidates) {
+        // Try GET first
+        debugPrint('HttpSseStreamChannel connecting to $sseUri');
+        try {
+          final getReq = http.Request('GET', sseUri);
+          getReq.headers.addAll({
+            'Accept': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            ..._headers,
+          });
+          if (_cookieHeader != null) getReq.headers['Cookie'] = _cookieHeader!;
+          http.StreamedResponse attempt = await _sendWithRedirects(getReq, maxRedirects: 5);
+          int status = attempt.statusCode;
+          String ct = attempt.headers['content-type'] ?? '';
+          if (status == 200 && ct.contains('text/event-stream')) {
+            res = attempt;
+            connected = sseUri;
+            break;
+          } else {
+            debugPrint('HttpSseStreamChannel SSE attempt(GET) ${sseUri.path} -> ${status} ${ct}');
+          }
+        } catch (e) {
+          debugPrint('HttpSseStreamChannel SSE GET error for $sseUri: $e');
+        }
+
+        // Try POST fallback for SSE if GET didn't succeed
+        try {
+          final postReq = http.Request('POST', sseUri);
+          postReq.headers.addAll({
+            'Accept': 'text/event-stream',
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            ..._headers,
+          });
+          if (_cookieHeader != null) postReq.headers['Cookie'] = _cookieHeader!;
+          // Empty body JSON to open a stream where servers require it
+          postReq.body = '{}';
+          http.StreamedResponse attempt = await _sendWithRedirects(postReq, maxRedirects: 5);
+          int status = attempt.statusCode;
+          String ct = attempt.headers['content-type'] ?? '';
+          if (status == 200 && ct.contains('text/event-stream')) {
+            res = attempt;
+            connected = sseUri;
+            break;
+          } else {
+            debugPrint('HttpSseStreamChannel SSE attempt(POST) ${sseUri.path} -> ${status} ${ct}');
+          }
+        } catch (e) {
+          debugPrint('HttpSseStreamChannel SSE POST error for $sseUri: $e');
+        }
+      }
+
+      if (res == null || connected == null) {
+        throw Exception('SSE connection failed: no candidate endpoints accepted');
       }
 
       _retries = 0; // reset backoff on successful connect
@@ -123,7 +248,8 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
     if (_disposed) return;
     _reconnectTimer?.cancel();
     // Exponential backoff up to 30s
-    final seconds = (1 << (_retries.clamp(0, 5))) ; // 1,2,4,8,16,32
+    final pow = _retries.clamp(0, 5);
+    final seconds = 1 << pow; // 1,2,4,8,16,32
     final delay = Duration(seconds: seconds.clamp(1, 30));
     _retries++;
     debugPrint('HttpSseStreamChannel reconnect in ${delay.inSeconds}s');
@@ -341,10 +467,16 @@ class _HttpSseSink implements StreamSink<String> {
         current,
         headers: {
           'Content-Type': 'application/json',
+          // Some gateways require Accept to advertise both JSON and SSE response capability
+          'Accept': 'application/json, text/event-stream',
           ..._owner._headers,
         },
         body: body,
       );
+      final setCookie = res.headers['set-cookie'];
+      if (setCookie != null && setCookie.isNotEmpty) {
+        _owner._cookieHeader = _owner._extractCookieHeader(setCookie);
+      }
       if (res.statusCode == 307 || res.statusCode == 302 || res.statusCode == 301) {
         final loc = res.headers['location'];
         if (loc == null || loc.isEmpty) return res;

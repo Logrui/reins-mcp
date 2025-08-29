@@ -12,6 +12,7 @@ class McpServersSettings extends StatefulWidget {
 }
 
 class _McpServersSettingsState extends State<McpServersSettings> {
+  bool _hasUnsavedChanges = false;
   late final Box _settingsBox;
   late List<_EditableServer> _servers;
 
@@ -20,6 +21,10 @@ class _McpServersSettingsState extends State<McpServersSettings> {
     super.initState();
     _settingsBox = Hive.box('settings');
     _load();
+    // Add a listener to each server to track changes for the save button
+    for (final server in _servers) {
+      server.addListener(_onChanged);
+    }
   }
 
   void _load() {
@@ -46,6 +51,14 @@ class _McpServersSettingsState extends State<McpServersSettings> {
 
   Future<void> _saveAndReconnect() async {
     final mcpService = context.read<McpService>();
+    final hasErrors = _servers.any((s) => s.endpointError.value != null);
+    if (hasErrors) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please fix the errors before saving.')),
+      );
+      return;
+    }
+
     final list = _servers
         .where((e) => e.endpointController.text.trim().isNotEmpty)
         .map((e) => McpServerConfig(
@@ -59,6 +72,7 @@ class _McpServersSettingsState extends State<McpServersSettings> {
             ).toJson())
         .toList();
     await _settingsBox.put('mcpServers', list);
+    setState(() => _hasUnsavedChanges = false);
 
     // Reconnect sequence
     await mcpService.disconnectAll();
@@ -74,16 +88,38 @@ class _McpServersSettingsState extends State<McpServersSettings> {
   }
 
   void _addServer() {
+    final newServer = _EditableServer();
+    newServer.addListener(_onChanged);
     setState(() {
-      _servers.add(_EditableServer());
+      _servers.add(newServer);
     });
   }
 
-  void _removeAt(int index) {
-    setState(() {
-      _servers.removeAt(index);
-    });
-    _saveAndReconnect();
+  void _removeAt(int index) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirm Deletion'),
+        content: const Text('Are you sure you want to remove this server?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      _servers.removeAt(index).dispose();
+      setState(() {});
+      _saveAndReconnect();
+    }
   }
 
   Widget _statusChipForUrl(BuildContext context, String serverUrl) {
@@ -100,6 +136,7 @@ class _McpServersSettingsState extends State<McpServersSettings> {
 
         Color color;
         String label;
+        String? errorMessage;
         switch (state) {
           case McpConnectionState.connecting:
             color = Colors.amber;
@@ -112,13 +149,14 @@ class _McpServersSettingsState extends State<McpServersSettings> {
           case McpConnectionState.error:
             color = Colors.red;
             label = 'Error';
+            errorMessage = mcpService.getLastError(serverUrl);
             break;
           case McpConnectionState.disconnected:
             color = Colors.grey;
             label = 'Disconnected';
         }
 
-        return Chip(
+        final chip = Chip(
           label: Text(label),
           backgroundColor: color.withValues(alpha: 0.15),
           side: BorderSide(color: color.withValues(alpha: 0.6)),
@@ -126,6 +164,14 @@ class _McpServersSettingsState extends State<McpServersSettings> {
           materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
           visualDensity: VisualDensity.compact,
         );
+
+        if (errorMessage != null && errorMessage.isNotEmpty) {
+          return Tooltip(
+            message: errorMessage,
+            child: chip,
+          );
+        }
+        return chip;
       },
     );
   }
@@ -172,6 +218,22 @@ class _McpServersSettingsState extends State<McpServersSettings> {
   }
 
   @override
+  void dispose() {
+    for (final server in _servers) {
+      server.dispose();
+    }
+    super.dispose();
+  }
+
+  void _onChanged() {
+    if (mounted) {
+      setState(() {
+        _hasUnsavedChanges = true;
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -198,10 +260,15 @@ class _McpServersSettingsState extends State<McpServersSettings> {
               label: const Text('Add Server'),
             ),
             const SizedBox(width: 12),
-            OutlinedButton.icon(
-              onPressed: _saveAndReconnect,
-              icon: const Icon(Icons.save),
-              label: const Text('Save & Reconnect'),
+            ValueListenableBuilder<bool>(
+              valueListenable: ValueNotifier(_servers.any((s) => s.endpointError.value != null)),
+              builder: (context, hasErrors, child) {
+                return OutlinedButton.icon(
+                  onPressed: !_hasUnsavedChanges || hasErrors ? null : _saveAndReconnect,
+                  icon: const Icon(Icons.save),
+                  label: const Text('Save & Reconnect'),
+                );
+              },
             ),
           ],
         ),
@@ -230,14 +297,19 @@ class _McpServersSettingsState extends State<McpServersSettings> {
           const SizedBox(width: 8),
           Expanded(
             flex: 4,
-            child: TextField(
-              controller: item.endpointController,
-              keyboardType: TextInputType.url,
-              decoration: const InputDecoration(
-                labelText: 'Endpoint (ws://host:port/path)',
-                border: OutlineInputBorder(),
-              ),
-              onChanged: (_) {},
+            child: ValueListenableBuilder<String?>(
+              valueListenable: item.endpointError,
+              builder: (context, error, child) {
+                return TextField(
+                  controller: item.endpointController,
+                  keyboardType: TextInputType.url,
+                  decoration: InputDecoration(
+                    labelText: 'Endpoint (ws://host:port/path)',
+                    border: const OutlineInputBorder(),
+                    errorText: error,
+                  ),
+                );
+              },
             ),
           ),
           const SizedBox(width: 8),
@@ -306,20 +378,70 @@ class _McpServersSettingsState extends State<McpServersSettings> {
 }
 
 class _EditableServer {
+  final ValueNotifier<String?> endpointError = ValueNotifier(null);
   final TextEditingController nameController;
   final TextEditingController endpointController;
   final TextEditingController tokenController;
+  final List<VoidCallback> _listeners = [];
 
   _EditableServer()
       : nameController = TextEditingController(),
         endpointController = TextEditingController(),
-        tokenController = TextEditingController();
+        tokenController = TextEditingController() {
+    endpointController.addListener(_validateEndpoint);
+    nameController.addListener(_notifyListeners);
+    tokenController.addListener(_notifyListeners);
+  }
 
   factory _EditableServer.fromConfig(McpServerConfig cfg) {
     final e = _EditableServer();
     e.nameController.text = cfg.name;
     e.endpointController.text = cfg.endpoint;
     if (cfg.authToken != null) e.tokenController.text = cfg.authToken!;
+    e._validateEndpoint(); // Validate initial value
     return e;
+  }
+
+  void addListener(VoidCallback listener) {
+    _listeners.add(listener);
+  }
+
+  void removeListener(VoidCallback listener) {
+    _listeners.remove(listener);
+  }
+
+  void _notifyListeners() {
+    for (final listener in _listeners) {
+      listener();
+    }
+  }
+
+  void dispose() {
+    endpointController.removeListener(_validateEndpoint);
+    nameController.removeListener(_notifyListeners);
+    tokenController.removeListener(_notifyListeners);
+    nameController.dispose();
+    endpointController.dispose();
+    tokenController.dispose();
+    endpointError.dispose();
+  }
+
+  void _validateEndpoint() {
+    final text = endpointController.text.trim();
+    if (text.isEmpty) {
+      endpointError.value = null; // No error if empty, just can't save
+    } else {
+      try {
+        final uri = Uri.parse(text);
+        if (!uri.isAbsolute || !['ws', 'wss', 'http', 'https'].contains(uri.scheme)) {
+          endpointError.value = 'Use ws://, wss://, http://, or https://';
+        } else {
+          endpointError.value = null;
+        }
+      } catch (e) {
+        endpointError.value = 'Invalid URI format';
+      }
+    }
+    _notifyListeners();
   }
 }

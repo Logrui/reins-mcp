@@ -5,6 +5,10 @@ class OllamaModel {
   int size;
   String digest;
   OllamaModelDetails details;
+  // Optional capabilities returned by /api/show (e.g., ["tools"]).
+  List<String>? capabilities;
+  // Derived flag indicating native tool support.
+  bool supportsTools;
 
   OllamaModel({
     required this.name,
@@ -13,16 +17,24 @@ class OllamaModel {
     required this.size,
     required this.digest,
     required this.details,
+    this.capabilities,
+    this.supportsTools = false,
   });
 
-  factory OllamaModel.fromJson(Map<String, dynamic> json) => OllamaModel(
-        name: json["name"],
-        model: json["model"],
-        modifiedAt: DateTime.parse(json["modified_at"]),
-        size: json["size"],
-        digest: json["digest"],
-        details: OllamaModelDetails.fromJson(json["details"]),
-      );
+  factory OllamaModel.fromJson(Map<String, dynamic> json) {
+    return OllamaModel(
+      name: json["name"],
+      model: json["model"],
+      modifiedAt: DateTime.parse(json["modified_at"]),
+      size: json["size"],
+      digest: json["digest"],
+      details: OllamaModelDetails.fromJson(json["details"]),
+      // /api/tags does not include capabilities; default values here.
+      capabilities: null,
+      // Preserve supportsTools if it exists in the JSON, otherwise default to false
+      supportsTools: json['supportsTools'] ?? false,
+    );
+  }
 
   Map<String, dynamic> toJson() => {
         "name": name,
@@ -31,6 +43,8 @@ class OllamaModel {
         "size": size,
         "digest": digest,
         "details": details.toJson(),
+        "capabilities": capabilities,
+        "supportsTools": supportsTools,
       };
 
   @override
