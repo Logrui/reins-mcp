@@ -15,6 +15,18 @@ jobs:
           fetch-depth: 1      # shallow clone is fine
           lfs: false          # disable LFS for this job
           submodules: false   # keep off (we don’t need them for IPA)
+          sparse-checkout: |
+            android
+            ios
+            lib
+            assets
+            test
+            web
+            macos
+            analysis_options.yaml
+            pubspec.yaml
+            pubspec.lock
+          sparse-checkout-cone: true
 
       - name: Workaround git safe.directory for submodules
         run: |
