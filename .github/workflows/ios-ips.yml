@@ -35,7 +35,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.2'
+          flutter-version: '3.24.4'
           architecture: arm64
           cache: true
 
@@ -51,9 +51,11 @@ jobs:
 
       - name: Install CocoaPods
         run: |
-          sudo gem install cocoapods
+          sudo gem uninstall cocoapods -aIx || true
+          sudo gem install cocoapods -v 1.15.2 -N
+          pod --version
           cd ios
-          pod repo update
+          pod repo update || pod setup
           pod install
           cd ..
 
