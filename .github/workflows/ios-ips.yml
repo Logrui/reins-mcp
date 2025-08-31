@@ -14,7 +14,7 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
-          submodules: recursive
+          submodules: false
 
       - name: Workaround git safe.directory for submodules
         run: |
