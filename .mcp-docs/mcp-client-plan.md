@@ -96,6 +96,7 @@ Enable Reins to act as an MCP client, allowing LLMs to execute tools exposed by 
 
 - [x] __CI to produce unsigned IPA__: Added GitHub Actions workflow `/.github/workflows/ios-ips.yml` building `flutter build ipa --no-codesign` and uploading `reins-mcp-ipa` artifact.
 - [x] __Docs__: Created `/.mcp-docs/ios-altstore-deploy.md` with step-by-step instructions to download IPA and sideload via AltStore on Windows.
+- [x] __ATS exception__: Added `NSAppTransportSecurity` → `NSAllowsArbitraryLoads=true` in `ios/Runner/Info.plist` for dev HTTP testing; narrow this to LAN IPs or switch to HTTPS for production.
 
  - [ ] __Dev Observability & Logging Console__: Add a developer observability panel in chat and a multi-tab logging console in MCP Settings (details in Section 7).
 
