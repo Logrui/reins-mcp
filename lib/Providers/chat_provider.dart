@@ -10,7 +10,6 @@ import 'package:reins/Services/mcp_service.dart';
 import 'package:reins/Services/ollama_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
-import 'package:meta/meta.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:reins/Models/mcp.dart';
 import 'package:reins/Constants/tool_system_prompt.dart';
@@ -335,6 +334,15 @@ class ChatProvider extends ChangeNotifier {
       if (kDebugMode) {
         debugPrint('[ChatProvider] loop start: toolCallCount=$toolCallCount chatId=${associatedChat.id}');
       }
+      _mcpService.logDev(
+        level: McpLogLevel.debug,
+        category: 'chat',
+        message: 'loop start',
+        data: {
+          'chatId': associatedChat.id,
+          'toolCallCount': toolCallCount,
+        },
+      );
       // Re-enable the thinking indicator for each iteration. After a tool call,
       // the main stream indicator is cleared in _executeToolCall(). Without
       // re-enabling here, the next stream might be considered cancelled.
@@ -344,6 +352,15 @@ class ChatProvider extends ChangeNotifier {
       // Build system prompt with currently known tools from connected servers
       final allTools = await _mcpService.listTools();
       final toolSystemPrompt = generateToolSystemPrompt(allTools);
+      _mcpService.logDev(
+        level: McpLogLevel.debug,
+        category: 'chat',
+        message: 'prompt prepared',
+        data: {
+          'chatId': associatedChat.id,
+          'toolsCount': allTools.length,
+        },
+      );
 
       final messagesWithSystemPrompt = [
         OllamaMessage(toolSystemPrompt, role: OllamaMessageRole.system),
@@ -358,6 +375,16 @@ class ChatProvider extends ChangeNotifier {
       if (kDebugMode) {
         debugPrint('[ChatProvider] supportsTools: cached=$cachedSupportsTools resolved=$resolvedSupportsTools model=${associatedChat.model}');
       }
+      _mcpService.logDev(
+        level: McpLogLevel.debug,
+        category: 'chat',
+        message: 'supportsTools resolved',
+        data: {
+          'model': associatedChat.model,
+          'cached': cachedSupportsTools,
+          'resolved': resolvedSupportsTools,
+        },
+      );
 
       final stream = _ollamaService.chatStream(
         messagesWithSystemPrompt,
@@ -385,6 +412,15 @@ class ChatProvider extends ChangeNotifier {
           if (kDebugMode) {
             debugPrint('[ChatProvider] streaming started: msgId=${streamingMessage.id}');
           }
+          _mcpService.logDev(
+            level: McpLogLevel.debug,
+            category: 'chat',
+            message: 'stream start',
+            data: {
+              'chatId': associatedChat.id,
+              'messageId': streamingMessage.id,
+            },
+          );
         } else {
           streamingMessage.content += receivedMessage.content;
           // Important: if a tool call comes in chunks, merge it.
@@ -402,6 +438,17 @@ class ChatProvider extends ChangeNotifier {
           if (kDebugMode) {
             debugPrint('[ChatProvider] tool call detected: server=${tc.server} name=${tc.name} args=${tc.args}');
           }
+          _mcpService.logDev(
+            level: McpLogLevel.info,
+            serverUrl: tc.server,
+            category: 'chat',
+            message: 'intercept tool call',
+            data: {
+              'tool': tc.name,
+              'args': tc.args,
+            },
+            requestId: tc.id.isEmpty ? null : tc.id,
+          );
           break; // Exit stream to process the tool call
         }
       }
@@ -421,16 +468,45 @@ class ChatProvider extends ChangeNotifier {
         if (kDebugMode) {
           debugPrint('[ChatProvider] executing tool call #$toolCallCount: ${pendingToolCall.server}/${pendingToolCall.name}');
         }
+        _mcpService.logDev(
+          level: McpLogLevel.info,
+          serverUrl: pendingToolCall.server,
+          category: 'tool',
+          message: 'execute start',
+          data: {
+            'tool': pendingToolCall.name,
+          },
+          requestId: pendingToolCall.id.isEmpty ? null : pendingToolCall.id,
+        );
         await _executeToolCall(associatedChat, pendingToolCall);
         if (kDebugMode) {
           debugPrint('[ChatProvider] tool call finished #$toolCallCount: ${pendingToolCall.server}/${pendingToolCall.name}');
         }
+        _mcpService.logDev(
+          level: McpLogLevel.info,
+          serverUrl: pendingToolCall.server,
+          category: 'tool',
+          message: 'execute done',
+          data: {
+            'tool': pendingToolCall.name,
+          },
+          requestId: pendingToolCall.id.isEmpty ? null : pendingToolCall.id,
+        );
 
         // If the tool call was cancelled, stop processing this turn.
         final lastMessage = _messages.last;
         if (lastMessage.role == OllamaMessageRole.tool && lastMessage.toolResult?.error == 'Cancelled') {
           return null;
         }
+        _mcpService.logDev(
+          level: McpLogLevel.debug,
+          category: 'chat',
+          message: 'restart generation',
+          data: {
+            'chatId': associatedChat.id,
+            'nextIndex': toolCallCount,
+          },
+        );
         // Continue to the next iteration of the while loop.
       } else {
         // No tool call was made, this is the final response.
@@ -447,6 +523,15 @@ class ChatProvider extends ChangeNotifier {
         if (kDebugMode) {
           debugPrint('[ChatProvider] final response produced: len=${streamingMessage?.content.length ?? 0}');
         }
+        _mcpService.logDev(
+          level: McpLogLevel.info,
+          category: 'chat',
+          message: 'final response',
+          data: {
+            'chatId': associatedChat.id,
+            'length': streamingMessage?.content.length,
+          },
+        );
         return streamingMessage; // Exit the loop and the function.
       }
     }
@@ -459,6 +544,15 @@ class ChatProvider extends ChangeNotifier {
     errorMessage.createdAt = DateTime.now();
     _messages.add(errorMessage);
     notifyListeners();
+    _mcpService.logDev(
+      level: McpLogLevel.warn,
+      category: 'chat',
+      message: 'tool loop limit exceeded',
+      data: {
+        'chatId': associatedChat.id,
+        'limit': _maxToolCallsPerTurn,
+      },
+    );
     return errorMessage;
   }
 
@@ -482,10 +576,32 @@ class ChatProvider extends ChangeNotifier {
     if (kDebugMode) {
       debugPrint('[ChatProvider] tool message created: msgId=${toolMessage.id} for ${toolCall.server}/${toolCall.name}');
     }
+    _mcpService.logDev(
+      level: McpLogLevel.debug,
+      serverUrl: toolCall.server,
+      category: 'tool',
+      message: 'tool message created',
+      data: {
+        'messageId': toolMessage.id,
+        'tool': toolCall.name,
+      },
+      requestId: toolCall.id.isEmpty ? null : toolCall.id,
+    );
     notifyListeners();
 
     // If the call was cancelled while it was running, do nothing.
     if (!_activeToolCalls.containsKey(toolMessage.id)) {
+      _mcpService.logDev(
+        level: McpLogLevel.info,
+        serverUrl: toolCall.server,
+        category: 'tool',
+        message: 'cancelled before start',
+        data: {
+          'messageId': toolMessage.id,
+          'tool': toolCall.name,
+        },
+        requestId: toolCall.id.isEmpty ? null : toolCall.id,
+      );
       return;
     }
 
@@ -507,6 +623,17 @@ class ChatProvider extends ChangeNotifier {
       if (kDebugMode) {
         debugPrint('[ChatProvider] tool args validation failed for ${toolCall.server}/${toolCall.name}: $err');
       }
+      _mcpService.logDev(
+        level: McpLogLevel.warn,
+        serverUrl: toolCall.server,
+        category: 'tool',
+        message: 'validation failed',
+        data: {
+          'tool': toolCall.name,
+          'error': err,
+        },
+        requestId: toolCall.id.isEmpty ? null : toolCall.id,
+      );
       return;
     }
 
@@ -515,6 +642,17 @@ class ChatProvider extends ChangeNotifier {
       if (kDebugMode) {
         debugPrint('[ChatProvider] calling MCP tool: ${toolCall.server}/${toolCall.name} args=${toolCall.args}');
       }
+      _mcpService.logDev(
+        level: McpLogLevel.info,
+        serverUrl: toolCall.server,
+        category: 'tool',
+        message: 'dispatch call',
+        data: {
+          'tool': toolCall.name,
+          'args': toolCall.args,
+        },
+        requestId: toolCall.id.isEmpty ? null : toolCall.id,
+      );
       final resp = await _mcpService.call(toolCall.server, toolCall.name, toolCall.args);
       toolResult = McpToolResult(
         result: resp.result,
@@ -525,10 +663,32 @@ class ChatProvider extends ChangeNotifier {
         result: null,
         error: e.toString(),
       );
+      _mcpService.logDev(
+        level: McpLogLevel.error,
+        serverUrl: toolCall.server,
+        category: 'tool',
+        message: 'call threw',
+        data: {
+          'tool': toolCall.name,
+          'error': e.toString(),
+        },
+        requestId: toolCall.id.isEmpty ? null : toolCall.id,
+      );
     }
 
     // If cancelled after completion but before UI update, still do nothing.
     if (!_activeToolCalls.containsKey(toolMessage.id)) {
+      _mcpService.logDev(
+        level: McpLogLevel.info,
+        serverUrl: toolCall.server,
+        category: 'tool',
+        message: 'cancelled after call',
+        data: {
+          'messageId': toolMessage.id,
+          'tool': toolCall.name,
+        },
+        requestId: toolCall.id.isEmpty ? null : toolCall.id,
+      );
       return;
     }
 
@@ -539,6 +699,17 @@ class ChatProvider extends ChangeNotifier {
     if (kDebugMode) {
       debugPrint('[ChatProvider] MCP tool result: ok=${toolResult.error == null} len=${toolMessage.content.length}');
     }
+    _mcpService.logDev(
+      level: McpLogLevel.info,
+      serverUrl: toolCall.server,
+      category: 'tool',
+      message: 'result saved',
+      data: {
+        'tool': toolCall.name,
+        'ok': toolResult.error == null,
+      },
+      requestId: toolCall.id.isEmpty ? null : toolCall.id,
+    );
 
     _activeToolCalls.remove(toolMessage.id);
     if (_dbEnabled) {
@@ -555,6 +726,16 @@ class ChatProvider extends ChangeNotifier {
     if (kDebugMode) {
       debugPrint('[ChatProvider] tool call completed, returning to stream loop');
     }
+    _mcpService.logDev(
+      level: McpLogLevel.debug,
+      serverUrl: toolCall.server,
+      category: 'chat',
+      message: 'return to stream',
+      data: {
+        'chatId': associatedChat.id,
+      },
+      requestId: toolCall.id.isEmpty ? null : toolCall.id,
+    );
   }
 
   Future<void> regenerateMessage(OllamaMessage message) async {
@@ -631,6 +812,16 @@ class ChatProvider extends ChangeNotifier {
       _activeChatStreams.remove(currentChat!.id);
     }
     notifyListeners();
+    if (currentChat?.id != null) {
+      _mcpService.logDev(
+        level: McpLogLevel.info,
+        category: 'chat',
+        message: 'stream cancel requested',
+        data: {
+          'chatId': currentChat!.id,
+        },
+      );
+    }
   }
 
   void cancelToolCall(String messageId) {
@@ -647,6 +838,17 @@ class ChatProvider extends ChangeNotifier {
             newToolResult: message.toolResult,
           );
         }
+        _mcpService.logDev(
+          level: McpLogLevel.info,
+          category: 'tool',
+          message: 'cancel requested',
+          data: {
+            'messageId': messageId,
+            'tool': message.toolCall?.name,
+          },
+          serverUrl: message.toolCall?.server,
+          requestId: (message.toolCall?.id.isEmpty ?? true) ? null : message.toolCall!.id,
+        );
       }
       notifyListeners();
     }

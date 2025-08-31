@@ -14,6 +14,102 @@ import 'package:reins/Utils/json_schema_validator.dart';
 
 enum McpConnectionState { disconnected, connecting, connected, error }
 
+/// Log levels for developer observability
+enum McpLogLevel { debug, info, warn, error }
+
+/// Structured log event for MCP activity
+class McpLogEvent {
+  final DateTime timestamp;
+  final String? serverUrl;
+  final McpLogLevel level;
+  final String category; // e.g., 'connect','rpc','tools','sse','chat'
+  final String message;
+  final Map<String, dynamic>? data;
+  final String? requestId;
+  final String? sessionId;
+
+  McpLogEvent({
+    DateTime? timestamp,
+    required this.level,
+    required this.category,
+    required this.message,
+    this.serverUrl,
+    this.data,
+    this.requestId,
+    this.sessionId,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
+
+/// Public logging interface exposed by McpService
+abstract class McpLogs {
+  Stream<McpLogEvent> stream();
+  List<McpLogEvent> recent({String? serverUrl});
+  void clear({String? serverUrl});
+  bool get devLoggingEnabled;
+  void enableDevLogging(bool enabled);
+}
+
+/// In-memory log controller with per-server ring buffers and a broadcast stream
+class _McpLogController implements McpLogs {
+  final _controller = StreamController<McpLogEvent>.broadcast();
+  final Map<String, List<McpLogEvent>> _byServer = {};
+  final List<McpLogEvent> _global = [];
+  final int _capacity;
+  bool _devEnabled;
+
+  _McpLogController({int capacity = 1000, bool devEnabled = kDebugMode})
+      : _capacity = capacity,
+        _devEnabled = devEnabled;
+
+  void add(McpLogEvent e) {
+    // Gate verbose logs when dev disabled
+    if (!_devEnabled && e.level == McpLogLevel.debug) return;
+    // Store globally
+    _push(_global, e);
+    // Store per server (null -> use 'global' bucket)
+    final key = e.serverUrl ?? '_global';
+    _push(_byServer.putIfAbsent(key, () => <McpLogEvent>[]), e);
+    // Broadcast
+    if (!_controller.isClosed) {
+      _controller.add(e);
+    }
+  }
+
+  void _push(List<McpLogEvent> buf, McpLogEvent e) {
+    buf.add(e);
+    final overflow = buf.length - _capacity;
+    if (overflow > 0) {
+      buf.removeRange(0, overflow);
+    }
+  }
+
+  @override
+  Stream<McpLogEvent> stream() => _controller.stream;
+
+  @override
+  List<McpLogEvent> recent({String? serverUrl}) {
+    if (serverUrl == null) return List.unmodifiable(_global);
+    return List.unmodifiable(_byServer[serverUrl] ?? const <McpLogEvent>[]);
+  }
+
+  @override
+  void clear({String? serverUrl}) {
+    if (serverUrl == null) {
+      _global.clear();
+      _byServer.clear();
+      return;
+    }
+    _byServer.remove(serverUrl);
+  }
+
+  @override
+  bool get devLoggingEnabled => _devEnabled;
+
+  @override
+  void enableDevLogging(bool enabled) {
+    _devEnabled = enabled;
+  }
+}
 
 /// Lightweight MessageChannel wrapper around HttpSseStreamChannel for lifecycle management
 class HttpPeerChannel implements MessageChannel {
@@ -67,8 +163,44 @@ class McpService extends ChangeNotifier {
   final Map<String, Uri> _endpointByServer = {};
   final Map<String, String?> _authByServer = {};
 
+  // --- Dev Observability Logs ---
+  final _McpLogController _logs = _McpLogController();
+
+  McpLogs get logs => _logs;
+
+  // Emit a structured developer log event
+  void logDev({
+    required McpLogLevel level,
+    String? serverUrl,
+    required String category,
+    required String message,
+    Map<String, dynamic>? data,
+    String? requestId,
+    String? sessionId,
+  }) {
+    try {
+      _logs.add(McpLogEvent(
+        level: level,
+        serverUrl: serverUrl,
+        category: category,
+        message: message,
+        data: data,
+        requestId: requestId,
+        sessionId: sessionId,
+      ));
+    } catch (_) {
+      // Swallow logging errors; never break runtime due to logging
+    }
+  }
+
   // --- Heartbeat & Reconnect ---
   void _startHeartbeat(String serverUrl, {Duration period = const Duration(seconds: 30)}) {
+    // Heartbeat only applies to WebSocket transports. HTTP/SSE uses server-initiated
+    // events and does not support $/ping in many gateways.
+    final uri = _endpointByServer[serverUrl];
+    if (uri == null || !(uri.scheme == 'ws' || uri.scheme == 'wss')) {
+      return;
+    }
     _heartbeatTimers[serverUrl]?.cancel();
     _heartbeatTimers[serverUrl] = Timer.periodic(period, (_) async {
       await _heartbeat(serverUrl);
@@ -76,25 +208,31 @@ class McpService extends ChangeNotifier {
   }
 
   Future<void> _heartbeat(String serverUrl) async {
-    final peer = _wsPeers[serverUrl];
     // Only WS needs explicit heartbeat; HTTP/SSE path uses persistent SSE
+    final uri = _endpointByServer[serverUrl];
+    if (uri == null || !(uri.scheme == 'ws' || uri.scheme == 'wss')) return;
+    final peer = _wsPeers[serverUrl];
     if (peer == null) return;
     try {
       // Use a benign ping; if method unsupported, it's still a live connection
       await peer.sendRequest(r'$/ping', {}).timeout(const Duration(seconds: 10));
       // success: reset retry counter
       _wsRetryCounts[serverUrl] = 0;
+      logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'heartbeat', message: 'Ping ok');
     } on TimeoutException {
       if (kDebugMode) debugPrint('MCP heartbeat timeout for $serverUrl');
+      logDev(level: McpLogLevel.warn, serverUrl: serverUrl, category: 'heartbeat', message: 'Ping timeout');
       _scheduleWsReconnect(serverUrl);
     } on rpc.RpcException catch (e) {
       if (e.code == -32601) {
         // Method not found -> treat as alive
         _wsRetryCounts[serverUrl] = 0;
       } else {
+        logDev(level: McpLogLevel.warn, serverUrl: serverUrl, category: 'heartbeat', message: 'Ping rpc error', data: {'code': e.code, 'message': e.message});
         _scheduleWsReconnect(serverUrl);
       }
     } catch (e) {
+      logDev(level: McpLogLevel.warn, serverUrl: serverUrl, category: 'heartbeat', message: 'Ping error', data: {'error': e.toString()});
       _scheduleWsReconnect(serverUrl);
     }
   }
@@ -110,6 +248,7 @@ class McpService extends ChangeNotifier {
     final delay = Duration(seconds: [1, 2, 4, 8, 16, 32][attempt]);
     _wsRetryCounts[serverUrl] = attempt + 1;
     if (kDebugMode) debugPrint('MCP WS reconnect to $serverUrl in ${delay.inSeconds}s');
+    logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'reconnect', message: 'Scheduling WS reconnect', data: {'attempt': attempt + 1, 'delaySec': delay.inSeconds});
     Timer(delay, () async {
       try {
         // tear down old channel if any
@@ -123,6 +262,7 @@ class McpService extends ChangeNotifier {
           peer.listen();
           peer.done.whenComplete(() {
             if (_channels[serverUrl] is WebSocketMessageChannel) {
+              logDev(level: McpLogLevel.warn, serverUrl: serverUrl, category: 'reconnect', message: 'Peer closed, scheduling reconnect');
               _scheduleWsReconnect(serverUrl);
             }
           });
@@ -133,8 +273,10 @@ class McpService extends ChangeNotifier {
         _wsRetryCounts[serverUrl] = 0;
         _startHeartbeat(serverUrl);
         await _listToolsForServer(serverUrl);
+        logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'reconnect', message: 'Reconnected successfully');
       } catch (e) {
         if (kDebugMode) debugPrint('MCP WS reconnect failed for $serverUrl: $e');
+        logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'reconnect', message: 'Reconnect failed', data: {'error': e.toString()});
         _scheduleWsReconnect(serverUrl);
       }
     });
@@ -245,12 +387,15 @@ class McpService extends ChangeNotifier {
       final uri = Uri.parse(serverUrl);
       MessageChannel channel;
 
+      logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'connect', message: 'Connecting', data: {'scheme': uri.scheme});
       if (uri.scheme == 'ws' || uri.scheme == 'wss') {
         // WebSocket transport
         channel = await _connectWebSocket(uri, authToken);
+        logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'connect', message: 'WebSocket channel created');
       } else if (uri.scheme == 'http' || uri.scheme == 'https') {
         // HTTP transport
         channel = await _connectHttp(uri, authToken, serverUrl);
+        logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'connect', message: 'HTTP/SSE channel created');
       } else {
         throw Exception('Unsupported protocol: ${uri.scheme}. Only HTTP and WebSocket are supported.');
       }
@@ -266,6 +411,7 @@ class McpService extends ChangeNotifier {
         // Reconnect on peer completion/close
         peer.done.whenComplete(() {
           if (_channels[serverUrl] is WebSocketMessageChannel) {
+            logDev(level: McpLogLevel.warn, serverUrl: serverUrl, category: 'connect', message: 'Peer closed');
             _scheduleWsReconnect(serverUrl);
           }
         });
@@ -283,11 +429,13 @@ class McpService extends ChangeNotifier {
       _startHeartbeat(serverUrl);
       await _listToolsForServer(serverUrl);
       notifyListeners();
+      logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'connect', message: 'Connected');
     } catch (e) {
       if (kDebugMode) debugPrint('Failed to connect to MCP server at $serverUrl: $e');
       _lastErrors[serverUrl] = e.toString();
       _setState(serverUrl, McpConnectionState.error);
       disconnect(serverUrl);
+      logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'connect', message: 'Connect failed', data: {'error': e.toString()});
     }
   }
 
@@ -300,9 +448,11 @@ class McpService extends ChangeNotifier {
 
     if (kIsWeb) {
       if (kDebugMode) debugPrint('MCP WebSocket connect (web) -> $uri');
+      logDev(level: McpLogLevel.debug, serverUrl: uri.toString(), category: 'ws', message: 'Connecting (web)');
       return WebSocketMessageChannel(WebSocketChannel.connect(uri));
     } else {
       if (kDebugMode) debugPrint('MCP WebSocket connect -> $uri');
+      logDev(level: McpLogLevel.debug, serverUrl: uri.toString(), category: 'ws', message: 'Connecting');
       final ws = io.IOWebSocketChannel.connect(
         uri,
         protocols: ['jsonrpc-2.0'],
@@ -320,6 +470,7 @@ class McpService extends ChangeNotifier {
     }
 
     if (kDebugMode) debugPrint('MCP HTTP connect -> $uri');
+    logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'http', message: 'HTTP/SSE connect');
     final client = http.Client();
     // Use StreamChannel-based HTTP/SSE channel and wrap with json_rpc_2.Peer
     final sse = HttpSseStreamChannel(client, uri, headers);
@@ -343,6 +494,7 @@ class McpService extends ChangeNotifier {
     _channels.remove(serverUrl);
     _serverTools.remove(serverUrl);
     _setState(serverUrl, McpConnectionState.disconnected);
+    logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'connect', message: 'Disconnected');
     
     // Fail pending requests
     final idsToFail = _pendingRequests.keys
@@ -368,6 +520,7 @@ class McpService extends ChangeNotifier {
   /// Initialize MCP connection
   Future<bool> _initialize(String serverUrl) async {
     try {
+      logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'rpc', message: 'initialize');
       final response = await _rpc(serverUrl, 'initialize', {
         'protocolVersion': '2024-11-05',
         'capabilities': {
@@ -383,14 +536,17 @@ class McpService extends ChangeNotifier {
       if (response.error != null) {
         if (kDebugMode) debugPrint('MCP initialize error: ${response.error}');
         _lastErrors[serverUrl] = 'Initialize failed: ${response.error}';
+        logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'rpc', message: 'initialize error', data: {'error': response.error.toString()});
         return false;
       }
 
       if (kDebugMode) debugPrint('MCP initialized successfully for $serverUrl');
+      logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'rpc', message: 'initialize ok');
       return true;
     } catch (e) {
       if (kDebugMode) debugPrint('MCP initialize timeout/error for $serverUrl: $e');
       _lastErrors[serverUrl] = 'Initialize failed: $e';
+       logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'rpc', message: 'initialize exception', data: {'error': e.toString()});
       return false;
     }
   }
@@ -398,12 +554,14 @@ class McpService extends ChangeNotifier {
   /// List tools from server
   Future<void> _listToolsForServer(String serverUrl) async {
     try {
+      logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'tools', message: 'tools/list');
       final response = await _rpc(serverUrl, 'tools/list', {})
           .timeout(const Duration(seconds: 15));
 
       if (response.error != null) {
         if (kDebugMode) debugPrint('MCP tools/list error: ${response.error}');
         _lastErrors[serverUrl] = response.error.toString();
+        logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'tools', message: 'tools/list error', data: {'error': response.error.toString()});
         return;
       }
 
@@ -421,9 +579,11 @@ class McpService extends ChangeNotifier {
 
       _serverTools[serverUrl] = tools;
       if (kDebugMode) debugPrint('MCP loaded ${tools.length} tools from $serverUrl');
+      logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'tools', message: 'Loaded tools', data: {'count': tools.length});
     } catch (e) {
       if (kDebugMode) debugPrint('MCP tools/list failed for $serverUrl: $e');
       _lastErrors[serverUrl] = 'Failed to list tools: $e';
+      logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'tools', message: 'tools/list exception', data: {'error': e.toString()});
     }
   }
 
@@ -438,16 +598,21 @@ class McpService extends ChangeNotifier {
     final peer = _wsPeers[serverUrl];
     if (peer != null) {
       try {
+        final reqId = _uuid.v4();
         if (kDebugMode) debugPrint('MCP(WS Peer) -> $method');
+        logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'rpc', message: 'request', data: {'method': method, 'requestId': reqId});
         final result = await peer.sendRequest(method, params);
+        logDev(level: McpLogLevel.debug, serverUrl: serverUrl, category: 'rpc', message: 'response', data: {'method': method, 'requestId': reqId});
         return McpResponse(result: result, error: null, id: 'peer');
       } on rpc.RpcException catch (e) {
+        logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'rpc', message: 'rpc error', data: {'method': method, 'code': e.code, 'message': e.message});
         return McpResponse(
           result: null,
           error: McpError(code: e.code, message: e.message, data: e.data),
           id: 'peer',
         );
       } catch (e) {
+        logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'rpc', message: 'exception', data: {'method': method, 'error': e.toString()});
         return McpResponse(
           result: null,
           error: McpError(code: -32000, message: e.toString(), data: null),
@@ -478,23 +643,27 @@ class McpService extends ChangeNotifier {
   /// Call a tool
   Future<McpToolResult> call(String serverUrl, String toolName, Map<String, dynamic> arguments, {Duration? timeout}) async {
     try {
+      logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'tool', message: 'call start', data: {'name': toolName});
       final response = await _rpc(serverUrl, 'tools/call', {
         'name': toolName,
         'arguments': arguments,
       }).timeout(timeout ?? const Duration(seconds: 30));
 
       if (response.error != null) {
+        logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'tool', message: 'call error', data: {'name': toolName, 'error': response.error.toString()});
         return McpToolResult(
           result: null,
           error: response.error.toString(),
         );
       }
 
+      logDev(level: McpLogLevel.info, serverUrl: serverUrl, category: 'tool', message: 'call ok', data: {'name': toolName});
       return McpToolResult(
         result: response.result,
         error: null,
       );
     } catch (e) {
+      logDev(level: McpLogLevel.error, serverUrl: serverUrl, category: 'tool', message: 'call exception', data: {'name': toolName, 'error': e.toString()});
       return McpToolResult(
         result: null,
         error: e.toString(),

@@ -175,7 +175,7 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
             connected = sseUri;
             break;
           } else {
-            debugPrint('HttpSseStreamChannel SSE attempt(GET) ${sseUri.path} -> ${status} ${ct}');
+            debugPrint('HttpSseStreamChannel SSE attempt(GET) ${sseUri.path} -> $status $ct');
           }
         } catch (e) {
           debugPrint('HttpSseStreamChannel SSE GET error for $sseUri: $e');
@@ -202,7 +202,7 @@ class HttpSseStreamChannel with StreamChannelMixin<String> implements StreamChan
             connected = sseUri;
             break;
           } else {
-            debugPrint('HttpSseStreamChannel SSE attempt(POST) ${sseUri.path} -> ${status} ${ct}');
+            debugPrint('HttpSseStreamChannel SSE attempt(POST) ${sseUri.path} -> $status $ct');
           }
         } catch (e) {
           debugPrint('HttpSseStreamChannel SSE POST error for $sseUri: $e');
@@ -412,6 +412,9 @@ class _HttpSseSink implements StreamSink<String> {
   _HttpSseSink(this._owner);
 
   bool _closed = false;
+  // Queue messages until a session endpoint is available, then flush.
+  final List<String> _pending = <String>[];
+  bool _flushScheduled = false;
 
   @override
   void add(String data) {
@@ -422,14 +425,24 @@ class _HttpSseSink implements StreamSink<String> {
   Future<void> _send(String json) async {
     try {
       final endpoints = <Uri>[];
+      // Wait for the server to emit the session endpoint via SSE. Do not
+      // attempt to POST to endpoints that require a session until it exists.
       final session = await _owner.waitForSession();
-      if (session != null) endpoints.add(session);
-      if (_owner.canonicalEndpoint != null) endpoints.add(_owner.canonicalEndpoint!);
-      endpoints.addAll([
-        _owner._baseUri.resolve('/message'),
-        _owner._baseUri.resolve('/rpc'),
-        _owner._baseUri,
-      ]);
+      if (session != null) {
+        endpoints.add(session);
+        if (_owner.canonicalEndpoint != null) endpoints.add(_owner.canonicalEndpoint!);
+      } else {
+        // No session yet; avoid spamming gateways with POSTs that will 400.
+        debugPrint('HttpSseStreamChannel session not ready; postponing send');
+      }
+
+      if (endpoints.isEmpty) {
+        // Defer sending until session endpoint is available.
+        debugPrint('HttpSseStreamChannel session not ready; queuing message');
+        _pending.add(json);
+        _scheduleFlush();
+        return;
+      }
 
       http.Response? response;
       for (final endpoint in endpoints) {
@@ -457,6 +470,22 @@ class _HttpSseSink implements StreamSink<String> {
     } catch (e) {
       debugPrint('HttpSseStreamChannel send error: $e');
     }
+  }
+
+  void _scheduleFlush() {
+    if (_flushScheduled) return;
+    _flushScheduled = true;
+    _owner.waitForSession(timeout: const Duration(seconds: 15)).then((uri) async {
+      _flushScheduled = false;
+      if (uri == null || _closed) return;
+      // Drain the queue now that session endpoint is available
+      while (_pending.isNotEmpty && !_closed) {
+        final payload = _pending.removeAt(0);
+        await _send(payload);
+      }
+    }).catchError((_) {
+      _flushScheduled = false;
+    });
   }
 
   Future<http.Response> _postWithRedirects(Uri uri, String body, {int maxRedirects = 5}) async {

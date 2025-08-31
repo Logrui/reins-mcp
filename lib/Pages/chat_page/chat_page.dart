@@ -22,7 +22,8 @@ import 'package:responsive_framework/responsive_framework.dart';
 import 'subwidgets/subwidgets.dart';
 
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key});
+  final VoidCallback? onToggleDevPanel;
+  const ChatPage({super.key, this.onToggleDevPanel});
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -81,7 +82,7 @@ class _ChatPageState extends State<ChatPage> {
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
             if (!ResponsiveBreakpoints.of(context).isMobile)
-              ChatAppBar(), // If the screen is large, show the app bar
+              ChatAppBar(onToggleDevPanel: widget.onToggleDevPanel), // Large screens: show app bar with debug toggle
             Expanded(
               child: Stack(
                 alignment: Alignment.bottomLeft,

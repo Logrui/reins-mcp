@@ -12,7 +12,8 @@ import 'package:reins/Models/ollama_model.dart';
 import 'package:reins/Services/ollama_service.dart';
 
 class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
-  const ChatAppBar({super.key});
+  final VoidCallback? onToggleDevPanel; // large screens: toggle side panel
+  const ChatAppBar({super.key, this.onToggleDevPanel});
 
   @override
   Widget build(BuildContext context) {
@@ -45,6 +46,28 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
           icon: const Icon(Icons.tune),
           onPressed: () {
             _handleConfigureButton(context);
+          },
+        ),
+        // Debug button
+        Builder(
+          builder: (ctx) {
+            // If a toggler is provided (large layout), use it to show/hide the side panel
+            if (onToggleDevPanel != null) {
+              return IconButton(
+                tooltip: 'Toggle Debug Panel',
+                icon: const Icon(Icons.bug_report_outlined),
+                onPressed: onToggleDevPanel,
+              );
+            }
+            // Otherwise (mobile), use the endDrawer if available
+            final scaffold = Scaffold.maybeOf(ctx);
+            final hasEndDrawer = scaffold?.hasEndDrawer ?? false;
+            if (!hasEndDrawer) return const SizedBox.shrink();
+            return IconButton(
+              tooltip: 'Open Debug Panel',
+              icon: const Icon(Icons.bug_report_outlined),
+              onPressed: () => scaffold!.openEndDrawer(),
+            );
           },
         ),
       ],

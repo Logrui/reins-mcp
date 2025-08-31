@@ -2,6 +2,12 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "../MCPJam"
+		},
+		{
+			"path": "../tome"
 		}
 	],
 	"settings": {}

@@ -17,7 +17,10 @@ Enable Reins to act as an MCP client, allowing LLMs to execute tools exposed by 
 - __Streaming Lifecycle Fixes__: Implemented thinking re-enable per loop, `supportsTools` cache, and explicit cancellation flags to stabilize multi-turn flows.
 - __Deterministic Transcript__: `ChatProvider` now appends assistant messages independent of UI state and fixes null-safety around tool-call handling.
 - __Tests Passing__: Multi-turn tool flow regression test now passes (two sequential tool calls + final answer).
-- __Focus__: Schema validation integrated; next priorities: observability and settings polish (last-error tooltip, status badges). Regression tests expanded for cancel/error paths.
+- __Dev Observability Logs__: Instrumented `ChatProvider` with `McpService.logDev()` around tool-call detection, execution, validation, cancellation, and stream restarts. Structured events include `requestId` from `McpToolCall.id` for log linkage.
+- __Settings Logs Console (Settings UI)__: Added live-tail logs console with filters, search, live-tail toggle, and clear in `lib/Pages/settings_page/subwidgets/mcp_settings.dart`, consuming `McpService.logs`. Levels color-coded; expandable JSON details.
+ - __Chat Dev Drawer__: Added a debug panel on the chat page in `lib/Pages/chat_page/subwidgets/chat_dev_drawer.dart` with server/level/category/search filters, live-tail auto-scroll, and a RequestId filter linked to tool-call IDs. On small screens it opens as an end-drawer overlay; on large screens it renders as a sibling right-side panel next to the chat and can be toggled from both the Chat AppBar bug button and the floating bug FAB.
+- __Focus__: Schema validation integrated; next priorities: Chat Dev panel, last-error tooltip + status badges, provider logging tests.
 
 ### Immediate Next Actions
 
@@ -29,10 +32,11 @@ Enable Reins to act as an MCP client, allowing LLMs to execute tools exposed by 
 ### Next Steps (short)
 
 - __Run Gateway streaming path__: Ensure Docker MCP Gateway is running with `--transport streaming` at `http://localhost:7999`.
-- __Reconnect + verify logs__: Look for `MCP HTTP(streaming) connect ->`, `MCP initialize OK`, and `MCP tools/list` totals.
+- __Reconnect + verify logs__: Look for `transport/rpc/tool` categories in logs and linkage by `requestId`.
 - __Full restart if needed__: If no initialize logs appear, perform a full app restart (not hot reload).
 - __Diagnose quickly__: Wire Settings tooltip to show `McpService.getLastError(serverUrl)` for last connection error.
-- __Selector param__: If tools remain empty, check whether the gateway requires a server selector in `tools/list`; add if necessary.
+  
+- __Provider logging tests__: Add integration tests to assert `ChatProvider` emits lifecycle logs with `requestId` on intercept/execute/validate/cancel.
 - __Add more regressions__: Cover timeout path for tool calls to complement the passing cancellation and server error tests.
 
 ---
@@ -78,6 +82,7 @@ Enable Reins to act as an MCP client, allowing LLMs to execute tools exposed by 
 - [x] __Step 1 — Provider deterministic transcript & persist-before-call__: Landed and verified by tests. (Completed 2025-08-29)
 - [x] __Add `tool` role & persistence__: `OllamaMessage` supports `tool` role; `DatabaseService` schema (v3) persists `role` including `tool`, plus `tool_call` and `tool_result`. `ChatProvider` creates tool-role messages for calls/results. (Completed 2025-08-29)
 - [x] __Implement schema validation__: `JsonSchemaValidator` (subset) added; `McpService.validateToolArguments()` exposed; `ChatProvider._executeToolCall()` short-circuits invalid args with inline error.
+- [x] __Instrument ChatProvider MCP logging__: Added `logDev()` around tool-call detection, execution start/done, validation failures, cancellations, and restart-generation with `requestId` linkage. (Completed 2025-08-29)
 - [ ] __Observability panel__: Build a developer panel showing recent MCP traffic and last errors; add log toggles.
 - [ ] __Settings polish__: Last-error tooltip from `McpService.getLastError(serverUrl)`, per-server auth tokens, status badges.
 - [ ] __Web SSE path__: Use `dart:html EventSource` under web builds; enforce WSS; add CORS/proxy notes to README.
@@ -86,6 +91,13 @@ Enable Reins to act as an MCP client, allowing LLMs to execute tools exposed by 
 - [ ] __Toggle for POST-to-open__: Some gateways require POST to establish SSE; surface a setting to force POST-first.
 - [ ] __Plan desktop stdio__: Spike a prototype behind a feature flag; scope OS-specific constraints and packaging.
 - [ ] __Add cancellation & error-path tests__: Server error and user-cancel tests implemented; add timeout regression next.
+
+### iOS (Windows) Deployment via AltStore
+
+- [x] __CI to produce unsigned IPA__: Added GitHub Actions workflow `/.github/workflows/ios-ips.yml` building `flutter build ipa --no-codesign` and uploading `reins-mcp-ipa` artifact.
+- [x] __Docs__: Created `/.mcp-docs/ios-altstore-deploy.md` with step-by-step instructions to download IPA and sideload via AltStore on Windows.
+
+ - [ ] __Dev Observability & Logging Console__: Add a developer observability panel in chat and a multi-tab logging console in MCP Settings (details in Section 7).
 
 #### Action Items — Stabilize Multi‑Turn Tool Flow Test
 
@@ -265,7 +277,29 @@ Validate end-to-end tool calling with both structured tools and the sentinel fal
   - Rewrote `chat_provider_tool_flow_test.dart` to validate the new end-to-end flow using structured `McpToolCall` and `McpToolResult` objects instead of string parsing.
 
 </details>
+<details>
+<summary>Progress Update — 2025-08-29 (ChatProvider MCP logging instrumentation)</summary>
 
+- Added structured developer logging in `lib/Providers/chat_provider.dart` using `McpService.logDev()` with categories `chat` and `tool`.
+- Emission points: loop start, prompt prepared, supportsTools resolved, stream start, intercept tool call, execute start/done, validation failed, cancelled before/after call, result saved, and return-to-stream.
+- Logs include `requestId` from `McpToolCall.id` and `serverUrl` when available; kept payloads concise to avoid leaking sensitive data.
+- Prepares for Settings/Chat Dev panels to live-tail MCP traffic and annotate turns.
+
+</details>
+<details>
+<summary>Progress Update — 2025-08-29 (Settings Logs UI fixes)</summary>
+
+- Fixed a runtime assertion in the logs server filter: deduplicated server options and guarded the selected value with an effective fallback when not present.
+- Doubled the logs panel height constraints from 160–320 to 320–640 for better vertical space.
+
+</details>
+<details>
+<summary>Progress Update — 2025-08-29 (HTTP/SSE connection fixes)</summary>
+
+- Prevented POSTs to `/message`, `/rpc`, or base before session is established; now queue requests until the SSE `endpoint` provides a `sessionid`, then flush to the emitted endpoint with canonical fallback.
+- Disabled `$\/ping` heartbeats for HTTP/SSE transports; heartbeats now only run for WebSocket connections.
+
+</details>
 <details>
 <summary>Progress Update — 2025-08-28 (Streaming Lifecycle Fix & Stability)</summary>
 
@@ -343,3 +377,224 @@ Validate end-to-end tool calling with both structured tools and the sentinel fal
 - Aligned with gateway contracts by handling lowercase `sessionid` and resolving `RequestURI` correctly.
 
 </details>
+
+---
+
+## 7. Dev Observability & Logging Console Plan
+
+### 7.1 Objectives
+
+- Provide real-time visibility into MCP connectivity, RPC traffic, tool discovery/calls, and errors.
+- Enable per-server diagnostics in Settings with live logs, filters, and export.
+- Keep production builds lean; guard verbose logs behind debug flags and a Dev toggle.
+
+### 7.2 Logging Architecture
+
+- __Model__: `McpLogEvent` with fields `{timestamp, serverUrl, level (debug|info|warn|error), category (transport|rpc|service|tool|ui), message, data? (Map), requestId?, sessionId?}`.
+- __Buffer__: Per-server ring buffer (default 500–1000 events). Global aggregate for the Dev panel. Oldest events drop.
+- __Streams__:
+  - `Stream<McpLogEvent>` per server and a global `BroadcastStream` for all.
+  - Convenience `ValueNotifier<List<McpLogEvent>>` for UI snapshots.
+- __Controller__: `McpLogController` inside `McpService` manages buffers and emits events. Expose via a lightweight interface `McpLogs` with:
+  - `listen(serverUrl?)`, `events(serverUrl?)`, `clear(serverUrl?)`, `export(serverUrl?, {range, level, category})`, `lastError(serverUrl)`.
+- __Emission points__ (instrumentation):
+  - WS/SSE connect/disconnect/retry, heartbeat timeouts, session discovery.
+  - `initialize`, `tools/list`, `tools/call` requests/responses, durations, payload sizes (summarized), errors.
+  - Schema validation results, argument short-circuit errors.
+  - Chat orchestration markers: intercept-tool-call, restart-generation, cancellation.
+  - Settings actions: add/edit/remove server, reconnect.
+- __Levels & filtering__: Gate debug-level emission with `kDebugMode || settings.devLoggingEnabled`.
+
+### 7.3 Settings: Logging Console (per-server tabs)
+
+- __Placement__: In `lib/Pages/settings_page/subwidgets/mcp_settings.dart`, add a new section “MCP Logs (Developer)” below server configuration.
+- __UI Structure__:
+  - TabBar with one tab per configured MCP server (by `name`), plus an “All” tab.
+  - AppBar row: level filter (All/Info/Warn/Error), category filter chips, search box, actions: Clear, Copy, Export, Pause/Resume live tail.
+  - Log list: virtualized `ListView.builder`, monospace lines like `[12:34:56.789] [WARN] [transport] connect retry in 2s — http://localhost:7999`.
+  - Expandable row: tap to expand and view structured JSON payloads (pretty-printed) for `data`.
+- __Behaviors__:
+  - Live tail follows unless paused; resume scroll when unpaused.
+  - Persist the last 100 events per server into Hive (optional) to show recent logs after app restart.
+  - Show last error badge in the tab label if present via `McpService.getLastError(serverUrl)`.
+
+### 7.4 Main Chat: Dev Observability Panel
+
+- __Placement (Implemented)__:
+  - Small screens: right-side end-drawer overlay.
+  - Large screens: fixed right-side sibling panel (420px) alongside the chat; toggled via the Chat AppBar bug button and the floating bug FAB. Panel exposes a close button and supports the same filters/live-tail as the drawer.
+- __What it shows__:
+  - Timeline of recent events across all servers with filters identical to Settings console.
+  - Per-turn annotations: when a tool call is intercepted/executed, show an inline marker with requestId linking to the log timeline.
+  - Connection status badges for each server (OK / Connecting / Error) with tooltip showing last error.
+  - Quick actions: Reconnect servers, toggle verbose logs, copy last error.
+- __Implementation__:
+  - New widget `DevObservabilityPanel` under `lib/Widgets/dev/` consuming `McpLogs` via Provider.
+  - Small status pill component `McpServerStatusBadge` used in Chat AppBar.
+  - Link tool-call messages to log entries by `requestId` (set in `ChatProvider` when dispatching MCP calls).
+
+### 7.5 Providers & Wiring
+
+- Provide `McpLogs` from `main.dart` next to `McpService` so both Settings and Chat can subscribe.
+- Add a `devLoggingEnabled` flag to settings; reflect it in a simple toggle in Settings.
+- On platform Web, ensure logs avoid large payloads; show summarized sizes and allow expand-on-demand.
+
+### 7.6 Minimal API Surface (draft)
+
+ ```
+ class McpLogs {
+   Stream<McpLogEvent> listen({String? serverUrl});
+   List<McpLogEvent> events({String? serverUrl});
+   void clear({String? serverUrl});
+   Future<String> export({String? serverUrl, DateTimeRange? range, Set<String>? levels, Set<String>? categories});
+   McpLastError? lastError(String serverUrl);
+ }
+ ```
+
+ ### 7.7 Testing Plan
+
+ - Service tests: verify events are emitted on connect, initialize, tools/list, tools/call (success and error), and that ring buffer trims as expected.
+ - Widget tests: Settings console shows tabs per server, filters work, live tail updates; Dev panel toggles and displays statuses and timeline markers.
+ - Chat provider integration: ensure `requestId` propagation links tool-call messages to log entries.
+
+ ### 7.8 Rollout & Safeguards
+
+ - Feature flag the Dev panel; disabled by default in release builds.
+ - Redact secrets from payloads; cap logged payload size and provide expand-to-view.
+ - Document known limitations (Web CORS, mixed content) and link to transport compatibility doc.
+
+## 8. MCPJam API Integration Contract (Flutter)
+ 
+ This section defines the concrete contract between Reins and MCPJam `/api/mcp` endpoints with minimal payload examples and SSE event types.
+ 
+ ### 8.1 Connect & Server Management
+ 
+ - POST `/api/mcp/connect`
+   - Body:
+     ```json
+     {
+       "serverId": "asana",
+       "serverConfig": {
+         "name": "asana",
+         "url": "https://your-mcp-gateway.example.com/sse",
+         "requestInit": { "headers": { "Authorization": "Bearer YOUR_TOKEN" } },
+         "eventSourceInit": { "withCredentials": false }
+       }
+     }
+     ```
+   - Success: `{ "success": true, "status": "connected" }`
+ 
+ - GET `/api/mcp/servers`
+   - Success: `{ "success": true, "servers": [{ "id": "asana", "name": "asana", "status": "connected", "config": { ... } }] }`
+ 
+ - GET `/api/mcp/servers/status/:serverId`
+   - Success: `{ "success": true, "serverId": "asana", "status": "connected" }`
+ 
+ - DELETE `/api/mcp/servers/:serverId`
+   - Success: `{ "success": true, "message": "Disconnected from server: asana" }`
+ 
+ - POST `/api/mcp/servers/reconnect`
+   - Body: `{ "serverId": "asana", "serverConfig": { ... } }`
+   - Success: `{ "success": true, "serverId": "asana", "status": "connected" }`
+ 
+ Notes:
+ - `serverConfig` accepts HTTP/SSE or CLI transports; validated in `server/utils/mcp-utils.ts`.
+ - For web, prefer SSE URL under HTTPS and WSS if using WS.
+ 
+ ### 8.2 Tools API (SSE)
+ 
+ - POST `/api/mcp/tools` with `action: "list"`
+   - Body:
+     ```json
+     {
+       "action": "list",
+       "serverConfig": { "name": "asana", "url": "https://.../sse" }
+     }
+     ```
+   - SSE events:
+     - `{"type":"tools_list","tools":{"search":{"description":"...","inputSchema":{...}}}}`
+     - `[DONE]`
+ 
+ - POST `/api/mcp/tools` with `action: "execute"`
+   - Body:
+     ```json
+     {
+       "action": "execute",
+       "serverConfig": { "name": "asana", "url": "https://.../sse" },
+       "toolName": "search",
+       "parameters": { "query": "foo" }
+     }
+     ```
+   - SSE events sequence:
+     - `{"type":"tool_executing","toolName":"search","parameters":{...}}`
+     - Optional elicitation: `{"type":"elicitation_request","requestId":"elicit_...","message":"...","schema":{...}}`
+     - Client responds via POST `/api/mcp/tools` with `action:"respond"`:
+       ```json
+       { "action":"respond", "requestId":"elicit_...", "response": { "action":"accept", "content": {"...": "..."} } }
+       ```
+     - `{"type":"tool_result","toolName":"search","result":{...}}`
+     - `{"type":"elicitation_complete","toolName":"search"}`
+     - `[DONE]`
+ 
+ - Errors emit: `{"type":"tool_error","error":"..."}`
+ 
+ ### 8.3 Resources API
+ 
+ - POST `/api/mcp/resources/list`
+   - Body: `{ "serverId": "asana" }`
+   - Success: `{ "resources": { "asana": [{"uri":"res://...","name":"...","mimeType":"..."}] } }`
+ 
+ - POST `/api/mcp/resources/read`
+   - Body: `{ "serverId": "asana", "uri": "res://path" }`
+   - Success: `{ "content": { "contents": [ {"type":"text","text":"..."} ] } }`
+ 
+ ### 8.4 Prompts API
+ 
+ - POST `/api/mcp/prompts/list`
+   - Body: `{ "serverId": "asana" }`
+   - Success: `{ "prompts": { "asana": [{"name":"summarize","description":"...","arguments":{...}}] } }`
+ 
+ - POST `/api/mcp/prompts/get`
+   - Body: `{ "serverId":"asana", "name":"summarize", "args": {"doc":"..."} }`
+   - Success: `{ "content": { "content": {"role":"system","parts":[...]} } }`
+ 
+ ### 8.5 Chat API (SSE)
+ 
+ - POST `/api/mcp/chat`
+   - Body:
+     ```json
+     {
+       "serverConfigs": {
+         "asana": { "name": "asana", "url": "https://.../sse" },
+         "github": { "name": "github", "url": "https://.../sse" }
+       },
+       "model": { "id": "gpt-4o-mini", "provider": "openai" },
+       "provider": "openai",
+       "apiKey": "sk-...",
+       "systemPrompt": "You are a helpful assistant.",
+       "temperature": 0.2,
+       "messages": [
+         { "role": "user", "content": "Find recent tasks and summarize." }
+       ]
+     }
+     ```
+   - SSE events (order may interleave):
+     - Text chunks: `{"type":"text","content":"..."}`
+     - Tool calls: `{"type":"tool_call","toolCall":{"id":1,"name":"search","parameters":{...},"status":"executing"}}`
+     - Tool results: `{"type":"tool_result","toolResult":{"id":1,"toolCallId":1,"result":{...}}}`
+     - Trace steps: `{"type":"trace_step","step":1,"text":"...","toolCalls":[...],"toolResults":[...]}`
+     - Elicitation request: `{"type":"elicitation_request","requestId":"elicit_...","message":"...","schema":{...}}`
+       - Respond via POST `/api/mcp/chat`:
+         ```json
+         { "action":"elicitation_response", "requestId":"elicit_...", "response": { "action":"accept", "content": {"...":"..."} } }
+         ```
+     - Elicitation complete: `{"type":"elicitation_complete"}`
+     - End: `[DONE]`
+   - Errors emit: `{"type":"error","error":"..."}`
+ 
+ ### 8.6 Flutter Client Notes
+ 
+ - Web: use `dart:html EventSource` for SSE endpoints; ensure HTTPS → WSS and CORS proxy if needed.
+ - Mobile/Desktop: use an SSE client that reads lines beginning with `data:` and parse JSON after the prefix.
+ - Always handle `[DONE]` to close streams and clear elicitation callbacks.
+ - Tool argument schemas are JSON Schema (Zod converted where applicable); validate before calls when possible.
