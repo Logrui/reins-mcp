@@ -26,7 +26,7 @@ jobs:
             analysis_options.yaml
             pubspec.yaml
             pubspec.lock
-          sparse-checkout-cone: true
+          sparse-checkout-cone-mode: true
 
       - name: Workaround git safe.directory for submodules
         run: |
@@ -59,12 +59,19 @@ jobs:
           pod install
           cd ..
 
-      - name: Build unsigned IPA
+      - name: Build unsigned iOS app (no codesign)
         run: |
-          flutter build ipa --release --no-codesign
+          flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/
+          zip -qry ReinsMCP-unsigned.ipa Payload
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: reins-mcp-ipa
-          path: build/ios/ipa/*.ipa
+          path: build/ios/iphoneos/ReinsMCP-unsigned.ipa

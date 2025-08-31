@@ -9,13 +9,13 @@ class MaterialColorAdapter extends TypeAdapter<MaterialColor> {
   MaterialColor read(BinaryReader reader) {
     final value = reader.readInt();
     return Colors.primaries.firstWhere(
-      (color) => color.toARGB32() == value,
+      (color) => color.value == value,
       orElse: () => Colors.grey,
     );
   }
 
   @override
   void write(BinaryWriter writer, MaterialColor obj) {
-    writer.writeInt(obj.toARGB32());
+    writer.writeInt(obj.value);
   }
 }
