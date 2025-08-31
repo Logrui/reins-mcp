@@ -12,9 +12,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          lfs: true
-          submodules: false
+          fetch-depth: 1      # shallow clone is fine
+          lfs: false          # disable LFS for this job
+          submodules: false   # keep off (we don’t need them for IPA)
 
       - name: Workaround git safe.directory for submodules
         run: |
